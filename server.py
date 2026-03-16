@@ -161,8 +161,10 @@ def clear_scores():
 
 # ---------------------------------------------------------------------------
 
+# init the DB whether we're running via gunicorn or directly
+init_db()
+
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 5050))
     print(f"[Flag Quiz Server] http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
