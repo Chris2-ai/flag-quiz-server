@@ -1,7 +1,7 @@
 """
 Flag Quiz - Leaderboard Server
 ================================
-Flask + SQLite backend. Deploy anywhere, free.
+Flask + PostgreSQL backend. Deploy anywhere, free.
 
 Endpoints
 ---------
@@ -14,36 +14,42 @@ Endpoints
 
 Deploy free on Render.com
 --------------------------
-  1. Put server.py + requirements.txt in a GitHub repo
-  2. render.com -> New Web Service -> connect repo
-  3. Build command:  pip install -r requirements.txt
-  4. Start command:  gunicorn server:app
-  5. Add env var:    API_KEY = something_secret
-  6. Your URL:       https://<your-service>.onrender.com
+  1. Create a free PostgreSQL database on Render
+  2. Copy the Internal Database URL
+  3. Add it as env var DATABASE_URL on your web service
+  4. Render injects it automatically at runtime -- no hardcoding needed
 
 Run locally
 -----------
-  pip install flask
+  pip install flask psycopg2-binary
+  set DATABASE_URL=postgresql://user:pass@host/dbname
   python server.py
   -> http://localhost:5050
 """
 
-import os, sqlite3, datetime
+import os, datetime
+import psycopg2
+import psycopg2.extras
 from flask import Flask, request, jsonify, g
 
 app     = Flask(__name__)
-DB_PATH = os.environ.get("DB_PATH", "quiz_scores.db")
 API_KEY = os.environ.get("API_KEY", "changeme")
+DB_URL  = os.environ.get("DATABASE_URL", "")
+
+# Render sometimes provides a postgres:// URL (legacy format)
+# psycopg2 requires postgresql:// so we fix it here
+if DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
 
 # ---------------------------------------------------------------------------
-#  Database helpers
+#  Database connection
+#  One connection per request, closed when the request context tears down.
 # ---------------------------------------------------------------------------
 
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
+        g.db = psycopg2.connect(DB_URL)
     return g.db
 
 @app.teardown_appcontext
@@ -53,23 +59,26 @@ def close_db(exc=None):
         db.close()
 
 def init_db():
+    """Create the scores table and indexes if they don't exist yet."""
     with app.app_context():
-        db = get_db()
-        db.execute("""
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS scores (
-                id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                player  TEXT    NOT NULL,
-                mode    TEXT    NOT NULL,
-                score   INTEGER NOT NULL,
-                total   INTEGER NOT NULL,
-                pct     INTEGER NOT NULL,
-                date    TEXT    NOT NULL,
-                created TEXT    NOT NULL DEFAULT (datetime('now'))
+                id      SERIAL PRIMARY KEY,
+                player  TEXT        NOT NULL,
+                mode    TEXT        NOT NULL,
+                score   INTEGER     NOT NULL,
+                total   INTEGER     NOT NULL,
+                pct     INTEGER     NOT NULL,
+                date    TEXT        NOT NULL,
+                created TIMESTAMP   NOT NULL DEFAULT NOW()
             )
         """)
-        db.execute("CREATE INDEX IF NOT EXISTS idx_mode ON scores(mode)")
-        db.execute("CREATE INDEX IF NOT EXISTS idx_pct  ON scores(pct DESC)")
-        db.commit()
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_mode ON scores(mode)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pct  ON scores(pct DESC)")
+        conn.commit()
+        cur.close()
 
 
 # ---------------------------------------------------------------------------
@@ -102,15 +111,27 @@ def ping():
 def get_scores():
     mode  = request.args.get("mode")
     limit = min(int(request.args.get("limit", 200)), 500)
-    db    = get_db()
+    conn  = get_db()
+    cur   = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
     if mode:
-        rows = db.execute(
-            "SELECT * FROM scores WHERE mode=? ORDER BY pct DESC, score DESC LIMIT ?",
-            (mode, limit)).fetchall()
+        cur.execute("""
+            SELECT id, player, mode, score, total, pct, date
+            FROM scores
+            WHERE mode = %s
+            ORDER BY pct DESC, score DESC
+            LIMIT %s
+        """, (mode, limit))
     else:
-        rows = db.execute(
-            "SELECT * FROM scores ORDER BY pct DESC, score DESC LIMIT ?",
-            (limit,)).fetchall()
+        cur.execute("""
+            SELECT id, player, mode, score, total, pct, date
+            FROM scores
+            ORDER BY pct DESC, score DESC
+            LIMIT %s
+        """, (limit,))
+
+    rows = cur.fetchall()
+    cur.close()
     return jsonify([dict(r) for r in rows])
 
 
@@ -128,23 +149,42 @@ def post_score():
     pct    = round(score / total * 100) if total else 0
     date   = str(data.get("date") or datetime.date.today().isoformat())
 
-    db  = get_db()
-    cur = db.execute(
-        "INSERT INTO scores (player,mode,score,total,pct,date) VALUES (?,?,?,?,?,?)",
-        (player, mode, score, total, pct, date))
-    db.commit()
-    return jsonify({"ok": True, "id": cur.lastrowid}), 201
+    conn = get_db()
+    cur  = conn.cursor()
+    cur.execute("""
+        INSERT INTO scores (player, mode, score, total, pct, date)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING id
+    """, (player, mode, score, total, pct, date))
+    new_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    return jsonify({"ok": True, "id": new_id}), 201
 
 
 @app.route("/stats", methods=["GET"])
 def get_stats():
-    db  = get_db()
-    top = db.execute(
-        "SELECT player,pct,score,total,mode FROM scores ORDER BY pct DESC, score DESC LIMIT 1"
-    ).fetchone()
+    conn = get_db()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("SELECT COUNT(*) AS total FROM scores")
+    total_games = cur.fetchone()["total"]
+
+    cur.execute("SELECT COUNT(DISTINCT player) AS total FROM scores")
+    unique_players = cur.fetchone()["total"]
+
+    cur.execute("""
+        SELECT player, pct, score, total, mode
+        FROM scores
+        ORDER BY pct DESC, score DESC
+        LIMIT 1
+    """)
+    top = cur.fetchone()
+    cur.close()
+
     return jsonify({
-        "total_games":    db.execute("SELECT COUNT(*) FROM scores").fetchone()[0],
-        "unique_players": db.execute("SELECT COUNT(DISTINCT player) FROM scores").fetchone()[0],
+        "total_games":    total_games,
+        "unique_players": unique_players,
         "top":            dict(top) if top else None,
     })
 
@@ -153,15 +193,16 @@ def get_stats():
 def clear_scores():
     if request.headers.get("X-API-Key") != API_KEY:
         return jsonify({"error": "Unauthorized"}), 401
-    db = get_db()
-    db.execute("DELETE FROM scores")
-    db.commit()
+    conn = get_db()
+    cur  = conn.cursor()
+    cur.execute("DELETE FROM scores")
+    conn.commit()
+    cur.close()
     return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
-
-# init the DB whether we're running via gunicorn or directly
+# init the DB on startup -- works for both gunicorn and direct python runs
 init_db()
 
 if __name__ == "__main__":
