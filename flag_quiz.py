@@ -1,16 +1,16 @@
 """
-World Flag & Map Quiz  --  v7  (Internet Leaderboard)
-======================================================
-* Set a server URL once in the menu -- everyone uses the same URL.
-* Scores post automatically after every game.
-* Leaderboard auto-refreshes every 5 s while open.
-* Works from anywhere in the world, no LAN required.
-* Falls back to local-only mode if no server is configured.
+World Flag & Map Quiz  --  v8  (User Accounts)
+================================================
+Same 4 game modes, now with proper user accounts.
 
-Server: see server.py + requirements.txt (deploy free on Render/Railway).
+Account flow:
+  - Connect to the server URL on the main menu
+  - Register once, log in on return visits
+  - Scores are linked to your account so your full history is tracked
+  - Guest play is still available -- scores just stay local
 
-Dependencies:  pycountry  pillow  requests(optional)
-Install:       pip install pycountry pillow requests
+Dependencies:
+  pip install pycountry pillow requests
 """
 
 import json, os, random, difflib, threading, urllib.request, urllib.parse
@@ -19,61 +19,66 @@ import tkinter as tk
 from tkinter import ttk, messagebox, font as tkfont
 from io import BytesIO
 
+
 # ---------------------------------------------------------------------------
-#  HTTP helpers  (use requests if available, else stdlib urllib)
+# HTTP layer -- prefers requests, falls back to stdlib urllib
+# Both functions accept an optional headers dict for auth tokens etc.
 # ---------------------------------------------------------------------------
 try:
     import requests as _req
 
-    def fetch_bytes(url, timeout=14):
-        r = _req.get(url, timeout=timeout)
+    def fetch_bytes(url, timeout=14, headers=None):
+        r = _req.get(url, timeout=timeout, headers=headers or {})
         r.raise_for_status()
         return r.content
 
-    def post_json(url, payload, timeout=8):
-        r = _req.post(url, json=payload, timeout=timeout)
+    def post_json(url, payload, timeout=8, headers=None):
+        r = _req.post(url, json=payload, timeout=timeout, headers=headers or {})
         r.raise_for_status()
         return r.content
 
 except ImportError:
-    def fetch_bytes(url, timeout=14):
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+    def fetch_bytes(url, timeout=14, headers=None):
+        req = urllib.request.Request(url, headers=headers or {})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read()
 
-    def post_json(url, payload, timeout=8):
-        body = json.dumps(payload).encode()
-        req  = urllib.request.Request(
-            url, data=body,
-            headers={"Content-Type": "application/json"}, method="POST")
+    def post_json(url, payload, timeout=8, headers=None):
+        body        = json.dumps(payload).encode()
+        all_headers = {"Content-Type": "application/json"}
+        if headers:
+            all_headers.update(headers)
+        req = urllib.request.Request(
+            url, data=body, headers=all_headers, method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read()
 
 try:
     from PIL import Image, ImageTk
 except ImportError:
-    raise SystemExit("Please install Pillow:  pip install pillow")
+    raise SystemExit("Missing dependency -- run:  pip install pillow")
+
 try:
     import pycountry
 except ImportError:
-    raise SystemExit("Please install pycountry:  pip install pycountry")
+    raise SystemExit("Missing dependency -- run:  pip install pycountry")
 
 
 # ---------------------------------------------------------------------------
-#  Remote leaderboard client
+# RemoteClient -- talks to the Flask leaderboard server
+# All calls are best-effort -- network errors never crash or block the quiz
 # ---------------------------------------------------------------------------
 
 class RemoteClient:
-    """
-    Talks to the Flask/SQLite server (server.py).
-    All calls are fire-and-forget / best-effort -- network errors never
-    crash or block the quiz.
-    """
 
     def __init__(self, base_url: str):
         url = base_url.strip().rstrip("/")
         if url and not url.startswith(("http://", "https://")):
             url = "https://" + url
         self.base = url
+
+    def _auth_header(self, token):
+        return {"Authorization": f"Bearer {token}"} if token else {}
 
     def ping(self, timeout=6) -> bool:
         if not self.base:
@@ -84,16 +89,68 @@ class RemoteClient:
         except Exception:
             return False
 
-    def post_score(self, player, mode, score, total):
+    def register(self, username, password):
+        """Returns (token, error_msg). token is None on failure."""
+        try:
+            data = json.loads(post_json(
+                f"{self.base}/register",
+                {"username": username, "password": password}))
+            if "token" in data:
+                return data["token"], None
+            return None, data.get("error", "Registration failed")
+        except Exception as exc:
+            msg = str(exc)
+            # pull out the server's error message if we can
+            if hasattr(exc, "read"):
+                try:
+                    msg = json.loads(exc.read()).get("error", msg)
+                except Exception:
+                    pass
+            return None, msg
+
+    def login(self, username, password):
+        """Returns (token, error_msg). token is None on failure."""
+        try:
+            data = json.loads(post_json(
+                f"{self.base}/login",
+                {"username": username, "password": password}))
+            if "token" in data:
+                return data["token"], None
+            return None, data.get("error", "Login failed")
+        except Exception as exc:
+            msg = str(exc)
+            if hasattr(exc, "read"):
+                try:
+                    msg = json.loads(exc.read()).get("error", msg)
+                except Exception:
+                    pass
+            return None, msg
+
+    def verify_token(self, token):
+        """Returns username if the token is still valid, None if expired/invalid."""
+        if not self.base or not token:
+            return None
+        try:
+            data = json.loads(fetch_bytes(
+                f"{self.base}/me",
+                headers=self._auth_header(token)))
+            return data.get("username")
+        except Exception:
+            return None
+
+    def post_score(self, player, mode, score, total, token=None):
         if not self.base:
             return
         pct   = round(score / total * 100) if total else 0
-        entry = {"player": player, "mode": mode,
-                  "score": score,  "total": total,
-                  "pct":   pct,
-                  "date":  datetime.date.today().isoformat()}
+        entry = {
+            "player": player, "mode": mode,
+            "score":  score,  "total": total,
+            "pct":    pct,
+            "date":   datetime.date.today().isoformat(),
+        }
         try:
-            post_json(f"{self.base}/score", entry)
+            post_json(f"{self.base}/score", entry,
+                      headers=self._auth_header(token))
         except Exception as exc:
             print(f"[RemoteClient] post_score failed: {exc}")
 
@@ -109,6 +166,16 @@ class RemoteClient:
         except Exception:
             return None
 
+    def get_profile(self, username):
+        """Returns the full attempt history for a user, or None on error."""
+        if not self.base:
+            return None
+        try:
+            return json.loads(fetch_bytes(
+                f"{self.base}/profile/{urllib.parse.quote(username)}", timeout=8))
+        except Exception:
+            return None
+
     def get_stats(self):
         if not self.base:
             return None
@@ -119,7 +186,8 @@ class RemoteClient:
 
 
 # ---------------------------------------------------------------------------
-#  Local score database  (quiz_scores.json)
+# ScoreDB -- local JSON backup + persisted settings
+# Stores scores, last player name, server URL, and session token
 # ---------------------------------------------------------------------------
 
 _SCORE_FILE = os.path.join(
@@ -127,6 +195,7 @@ _SCORE_FILE = os.path.join(
 
 
 class ScoreDB:
+
     MODE_FLAG    = "Flag Quiz"
     MODE_ALL     = "All 197 Countries"
     MODE_MAP     = "Map Fill"
@@ -143,25 +212,26 @@ class ScoreDB:
                     return json.load(f)
             except Exception:
                 pass
-        return {"last_player": "", "server_url": "", "scores": []}
+        return {"last_player": "", "server_url": "", "token": "",
+                "logged_in_user": "", "scores": []}
 
     def _save(self):
         try:
             with open(_SCORE_FILE, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            print(f"[ScoreDB] save error: {e}")
+            print(f"[ScoreDB] could not save: {e}")
 
-    # -- properties --------------------------------------------------------
+    # -- persisted settings ------------------------------------------------
 
     @property
     def last_player(self):
         return self._data.get("last_player", "")
 
     @last_player.setter
-    def last_player(self, name):
+    def last_player(self, v):
         with self._lock:
-            self._data["last_player"] = name.strip()
+            self._data["last_player"] = v.strip()
             self._save()
 
     @property
@@ -169,19 +239,42 @@ class ScoreDB:
         return self._data.get("server_url", "")
 
     @server_url.setter
-    def server_url(self, url):
+    def server_url(self, v):
         with self._lock:
-            self._data["server_url"] = url.strip()
+            self._data["server_url"] = v.strip()
             self._save()
 
-    # -- score CRUD --------------------------------------------------------
+    @property
+    def token(self):
+        return self._data.get("token", "")
+
+    @token.setter
+    def token(self, v):
+        with self._lock:
+            self._data["token"] = v
+            self._save()
+
+    @property
+    def logged_in_user(self):
+        return self._data.get("logged_in_user", "")
+
+    @logged_in_user.setter
+    def logged_in_user(self, v):
+        with self._lock:
+            self._data["logged_in_user"] = v
+            self._save()
+
+    # -- score operations --------------------------------------------------
 
     def add(self, player, mode, score, total):
         player = (player or "Anonymous").strip()
         pct    = round(score / total * 100) if total else 0
-        entry  = {"player": player, "mode": mode, "score": score,
-                   "total": total,  "pct":  pct,
-                   "date":  datetime.date.today().isoformat()}
+        entry  = {
+            "player": player, "mode": mode,
+            "score":  score,  "total": total,
+            "pct":    pct,
+            "date":   datetime.date.today().isoformat(),
+        }
         with self._lock:
             self._data.setdefault("scores", []).append(entry)
             self._data["last_player"] = player
@@ -206,7 +299,7 @@ class ScoreDB:
 
 
 # ---------------------------------------------------------------------------
-#  Country data
+# Country data
 # ---------------------------------------------------------------------------
 
 SOVEREIGN = {
@@ -264,8 +357,8 @@ DISPLAY = {
     "Turkiye":                                 "Turkey",
 }
 
-def disp(n):
-    return DISPLAY.get(n, n)
+def disp(name):
+    return DISPLAY.get(name, name)
 
 def _build_aliases():
     d = {
@@ -294,43 +387,43 @@ def _build_aliases():
         "antigua":"Antigua and Barbuda","dr congo":"Congo, The Democratic Republic of the",
         "democratic republic of the congo":"Congo, The Democratic Republic of the",
     }
-    for py, friendly in DISPLAY.items():
-        d[friendly.lower()] = py
+    for official, friendly in DISPLAY.items():
+        d[friendly.lower()] = official
     return d
 
 ALIASES = _build_aliases()
 
-def resolve(raw):
-    key = raw.strip().lower()
+def resolve(raw_input):
+    key = raw_input.strip().lower()
     if key in ALIASES:
         return ALIASES[key]
     for name, _ in ALL_COUNTRIES:
         if name.lower() == key:
             return name
-    return raw
+    return raw_input
 
 def diff_hint(guess, correct):
-    r   = difflib.SequenceMatcher(None, guess.lower(), correct.lower()).ratio()
-    pre = "Almost! " if r > 0.75 else ""
-    return f'{pre}You wrote "{guess}"  ->  correct: "{correct}"'
+    similarity = difflib.SequenceMatcher(None, guess.lower(), correct.lower()).ratio()
+    prefix = "Almost! " if similarity > 0.75 else ""
+    return f'{prefix}You wrote "{guess}"  ->  correct: "{correct}"'
 
 
 # ---------------------------------------------------------------------------
-#  GeoJSON world map
+# GeoJSON world map
 # ---------------------------------------------------------------------------
 
 GEO_URL = ("https://raw.githubusercontent.com/datasets/geo-countries"
            "/master/data/countries.geojson")
 
-def _a3_map():
-    m = {}
+def _build_alpha3_lookup():
+    lookup = {}
     for c in pycountry.countries:
         if hasattr(c, "alpha_3"):
-            m[c.alpha_3.upper()] = c.alpha_2.lower()
-    m.update({"XKX": "xk", "PSE": "ps", "TWN": "tw"})
-    return m
+            lookup[c.alpha_3.upper()] = c.alpha_2.lower()
+    lookup.update({"XKX": "xk", "PSE": "ps", "TWN": "tw"})
+    return lookup
 
-A3_TO_A2 = _a3_map()
+A3_TO_A2 = _build_alpha3_lookup()
 
 ADMIN_MAP = {
     "france":"fr","norway":"no","somaliland":None,"northern cyprus":None,
@@ -376,7 +469,7 @@ def load_geojson(on_progress=None):
                 a2 = (props.get("ISO_A2") or props.get("iso_a2") or "").strip().lower()
             if not a2 or a2 not in SOVEREIGN:
                 continue
-            geom, gtype = feat.get("geometry", {}), ""
+            geom   = feat.get("geometry", {})
             gtype  = geom.get("type", "")
             coords = geom.get("coordinates", [])
             rings  = []
@@ -391,18 +484,18 @@ def load_geojson(on_progress=None):
             on_progress(f"Map ready -- {len(out)} countries loaded")
         return out
 
-def project_ring(ring, w, h, pad=8):
+def project_ring(ring, canvas_w, canvas_h, pad=8):
     pts = []
     for lon, lat in ring:
         pts.extend([
-            pad + (lon + 180) / 360 * (w - 2*pad),
-            pad + (90 - lat)  / 180 * (h - 2*pad),
+            pad + (lon + 180) / 360 * (canvas_w - 2 * pad),
+            pad + (90 - lat)  / 180 * (canvas_h - 2 * pad),
         ])
     return pts
 
 
 # ---------------------------------------------------------------------------
-#  Colours
+# Colour palette
 # ---------------------------------------------------------------------------
 BG         = "#0f172a"
 CARD       = "#1e293b"
@@ -427,10 +520,6 @@ MAP_MISS   = "#991b1b"
 MAP_MISS2  = "#7f1d1d"
 
 
-# ---------------------------------------------------------------------------
-#  TTK theme
-# ---------------------------------------------------------------------------
-
 def apply_styles():
     s = ttk.Style()
     try:
@@ -452,7 +541,7 @@ def apply_styles():
 
 
 # ---------------------------------------------------------------------------
-#  Main application
+# App
 # ---------------------------------------------------------------------------
 
 class App:
@@ -460,24 +549,32 @@ class App:
         self.root = root
         self.root.title("World Flag & Map Quiz")
         self.root.configure(bg=BG)
-        self.root.geometry("720x880")
+        self.root.geometry("720x900")
         self.root.resizable(True, True)
         apply_styles()
         self._fonts()
 
-        self._geo    = None
-        self.db      = ScoreDB()
-        self._player = self.db.last_player or ""
+        self._geo = None
+        self.db   = ScoreDB()
 
-        # Remote client -- None when no server URL is set
-        saved_url = self.db.server_url
+        # auth state
+        self._token          = self.db.token or None
+        self._logged_in_user = self.db.logged_in_user or None
+        self._player         = self._logged_in_user or self.db.last_player or ""
+
+        # remote client -- restored from saved URL
+        saved_url    = self.db.server_url
         self._remote = RemoteClient(saved_url) if saved_url else None
 
-        # Leaderboard window / polling
+        # leaderboard polling
         self._lb_poll_id = None
         self._lb_win     = None
 
-        self._menu()
+        # if we have a saved token, verify it silently before showing the menu
+        if self._remote and self._token:
+            self._verify_saved_token()
+        else:
+            self._menu()
 
     def _fonts(self):
         self.fT = tkfont.Font(family="Helvetica Neue", size=22, weight="bold")
@@ -493,38 +590,183 @@ class App:
         self._lb_stop_poll()
 
     # -----------------------------------------------------------------------
-    #  MENU
+    # Startup token verification
+    # -----------------------------------------------------------------------
+
+    def _verify_saved_token(self):
+        """
+        Check our saved token in the background on startup.
+        If it's still valid we go straight to the menu as logged in.
+        If it expired we clear it and go to menu as guest.
+        """
+        def _check():
+            username = self._remote.verify_token(self._token) if self._remote else None
+            def _done():
+                if username:
+                    self._logged_in_user = username
+                    self._player         = username
+                else:
+                    # token expired -- clear it so the login prompt shows next time
+                    self._token          = None
+                    self._logged_in_user = None
+                    self.db.token        = ""
+                    self.db.logged_in_user = ""
+                self._menu()
+            self.root.after(0, _done)
+        threading.Thread(target=_check, daemon=True).start()
+
+    # -----------------------------------------------------------------------
+    # Login / Register dialog
+    # -----------------------------------------------------------------------
+
+    def _show_auth_dialog(self, initial_tab="login"):
+        """
+        Modal dialog for login and registration.
+        Opens over the main menu so the user doesn't lose their context.
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Account")
+        dlg.configure(bg=BG)
+        dlg.geometry("440x400")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="Account", font=self.fT, bg=BG, fg=TEXT).pack(pady=(24, 4))
+
+        # tab toggle row
+        tab_frame = tk.Frame(dlg, bg=CARD,
+                             highlightbackground=ACCENT, highlightthickness=1)
+        tab_frame.pack(padx=50, pady=(8, 0), fill="x")
+
+        self._auth_tab = tk.StringVar(value=initial_tab)
+
+        btn_login = tk.Button(tab_frame, text="Log In", font=self.fB,
+                              relief="flat", cursor="hand2", padx=20, pady=8)
+        btn_reg   = tk.Button(tab_frame, text="Register", font=self.fB,
+                              relief="flat", cursor="hand2", padx=20, pady=8)
+        btn_login.pack(side="left", fill="x", expand=True)
+        btn_reg.pack(side="left",   fill="x", expand=True)
+
+        # form
+        form = tk.Frame(dlg, bg=CARD,
+                        highlightbackground=ACCENT, highlightthickness=1)
+        form.pack(padx=50, pady=0, fill="x")
+        form_inner = tk.Frame(form, bg=CARD)
+        form_inner.pack(padx=16, pady=16, fill="x")
+
+        tk.Label(form_inner, text="Username", font=self.fX, bg=CARD, fg=MUTED,
+                 anchor="w").pack(fill="x")
+        username_entry = tk.Entry(form_inner, font=self.fB, bg=ACCENT, fg=TEXT,
+                                  insertbackground=TEXT, relief="flat")
+        username_entry.pack(fill="x", ipady=6, pady=(2, 10))
+
+        tk.Label(form_inner, text="Password", font=self.fX, bg=CARD, fg=MUTED,
+                 anchor="w").pack(fill="x")
+        password_entry = tk.Entry(form_inner, font=self.fB, bg=ACCENT, fg=TEXT,
+                                  insertbackground=TEXT, relief="flat", show="*")
+        password_entry.pack(fill="x", ipady=6, pady=(2, 0))
+
+        # error label
+        error_var = tk.StringVar()
+        error_lbl = tk.Label(dlg, textvariable=error_var, font=self.fX,
+                             bg=BG, fg=ERROR, wraplength=340)
+        error_lbl.pack(pady=(8, 0))
+
+        # submit button
+        submit_btn = tk.Button(dlg, font=self.fS,
+                               bg=HIGHLIGHT, fg="white", relief="flat",
+                               cursor="hand2", padx=20, pady=10)
+        submit_btn.pack(pady=(8, 4))
+
+        tk.Button(dlg, text="Play as Guest instead",
+                  font=self.fX, bg=BG, fg=MUTED, relief="flat",
+                  cursor="hand2",
+                  command=dlg.destroy).pack()
+
+        # -- tab switching -------------------------------------------------
+
+        def set_tab(tab):
+            self._auth_tab.set(tab)
+            if tab == "login":
+                btn_login.config(bg=HIGHLIGHT, fg="white")
+                btn_reg.config(bg=CARD, fg=MUTED)
+                submit_btn.config(text="Log In")
+            else:
+                btn_reg.config(bg=HIGHLIGHT, fg="white")
+                btn_login.config(bg=CARD, fg=MUTED)
+                submit_btn.config(text="Register")
+            error_var.set("")
+
+        btn_login.config(command=lambda: set_tab("login"))
+        btn_reg.config(command=lambda: set_tab("register"))
+        set_tab(initial_tab)
+
+        # -- submit logic --------------------------------------------------
+
+        def do_submit():
+            username = username_entry.get().strip()
+            password = password_entry.get().strip()
+
+            if not username or not password:
+                error_var.set("Please fill in both fields.")
+                return
+
+            submit_btn.config(state="disabled", text="Please wait...")
+            error_var.set("")
+
+            def _try():
+                if self._auth_tab.get() == "login":
+                    token, err = self._remote.login(username, password)
+                else:
+                    token, err = self._remote.register(username, password)
+
+                def _done():
+                    submit_btn.config(state="normal")
+                    set_tab(self._auth_tab.get())   # restore button text
+                    if token:
+                        # success -- save credentials and refresh menu
+                        self._token          = token
+                        self._logged_in_user = username
+                        self._player         = username
+                        self.db.token        = token
+                        self.db.logged_in_user = username
+                        self.db.last_player    = username
+                        dlg.destroy()
+                        self._menu()
+                    else:
+                        error_var.set(err or "Something went wrong -- try again.")
+                self.root.after(0, _done)
+            threading.Thread(target=_try, daemon=True).start()
+
+        submit_btn.config(command=do_submit)
+        dlg.bind("<Return>", lambda e: do_submit())
+        username_entry.focus_set()
+
+    def _logout(self):
+        self._token          = None
+        self._logged_in_user = None
+        self._player         = self.db.last_player or ""
+        self.db.token        = ""
+        self.db.logged_in_user = ""
+        self._menu()
+
+    # -----------------------------------------------------------------------
+    # MENU
     # -----------------------------------------------------------------------
 
     def _menu(self):
         self._clear()
-        self.root.geometry("720x880")
+        self.root.geometry("720x900")
 
         tk.Label(self.root, text="World Flag & Map Quiz",
                  font=self.fT, bg=BG, fg=TEXT).pack(pady=(24, 4))
         tk.Label(self.root, text="Choose a game mode",
                  font=self.fS, bg=BG, fg=MUTED).pack(pady=(0, 8))
 
-        # -- Player name ---------------------------------------------------
-        pf = tk.Frame(self.root, bg=CARD, highlightbackground=ACCENT, highlightthickness=1)
-        pf.pack(padx=50, pady=(0, 4), fill="x")
-        ipf = tk.Frame(pf, bg=CARD)
-        ipf.pack(padx=12, pady=8, fill="x")
-        tk.Label(ipf, text="Player:", font=self.fX, bg=CARD, fg=MUTED).pack(side="left")
-        self._player_var = tk.StringVar(value=self._player)
-        pe = tk.Entry(ipf, textvariable=self._player_var, font=self.fB,
-                      bg=ACCENT, fg=TEXT, insertbackground=TEXT,
-                      relief="flat", width=22)
-        pe.pack(side="left", padx=8, ipady=4)
-        pe.bind("<FocusOut>", lambda e: self._update_player())
-        pe.bind("<Return>",   lambda e: self._update_player())
-        tk.Label(ipf, text="(name shown on leaderboard)", font=self.fX,
-                 bg=CARD, fg=MUTED).pack(side="left")
+        # server + account bar
+        self._build_account_bar()
 
-        # -- Server URL bar ------------------------------------------------
-        self._build_server_bar()
-
-        # -- Game modes ----------------------------------------------------
+        # game mode cards
         modes = [
             ("Flag Quiz",
              "Identify flags. Choose region & question count.",
@@ -540,35 +782,36 @@ class App:
              lambda: self._launch_map(True)),
         ]
         for title, desc, cmd in modes:
-            f = tk.Frame(self.root, bg=CARD, cursor="hand2",
-                         highlightbackground=ACCENT, highlightthickness=1)
-            f.pack(padx=50, pady=4, fill="x")
-            f.bind("<Enter>", lambda e, fr=f: fr.config(highlightbackground=HIGHLIGHT))
-            f.bind("<Leave>", lambda e, fr=f: fr.config(highlightbackground=ACCENT))
-            inn = tk.Frame(f, bg=CARD)
-            inn.pack(padx=14, pady=9, fill="x")
-            tk.Label(inn, text=title, font=self.fS, bg=CARD, fg=TEXT, anchor="w").pack(anchor="w")
-            tk.Label(inn, text=desc,  font=self.fX, bg=CARD, fg=MUTED,
+            card = tk.Frame(self.root, bg=CARD, cursor="hand2",
+                            highlightbackground=ACCENT, highlightthickness=1)
+            card.pack(padx=50, pady=4, fill="x")
+            card.bind("<Enter>", lambda e, f=card: f.config(highlightbackground=HIGHLIGHT))
+            card.bind("<Leave>", lambda e, f=card: f.config(highlightbackground=ACCENT))
+            inner = tk.Frame(card, bg=CARD)
+            inner.pack(padx=14, pady=9, fill="x")
+            tk.Label(inner, text=title, font=self.fS, bg=CARD, fg=TEXT, anchor="w").pack(anchor="w")
+            tk.Label(inner, text=desc,  font=self.fX, bg=CARD, fg=MUTED,
                      anchor="w").pack(anchor="w", pady=(2, 0))
-            for w in [f, inn] + list(inn.winfo_children()):
+            for w in [card, inner] + list(inner.winfo_children()):
                 w.bind("<Button-1>", lambda e, c=cmd: c())
 
-        # -- Leaderboard button --------------------------------------------
+        # leaderboard button
         has_remote = self._remote and bool(self._remote.base)
-        lb_f = tk.Frame(self.root, bg=CARD, cursor="hand2",
-                        highlightbackground=GOLD, highlightthickness=1)
-        lb_f.pack(padx=50, pady=4, fill="x")
-        lb_f.bind("<Enter>", lambda e: lb_f.config(highlightbackground=WARNING))
-        lb_f.bind("<Leave>", lambda e: lb_f.config(highlightbackground=GOLD))
-        lb_inn = tk.Frame(lb_f, bg=CARD)
-        lb_inn.pack(padx=14, pady=9, fill="x")
-        n_local = len(self.db.scores())
-        src_lbl = ("Live -- " + self._remote.base) if has_remote else f"Local  ({n_local} scores)"
-        tk.Label(lb_inn, text="Leaderboard", font=self.fS,
+        lb_card = tk.Frame(self.root, bg=CARD, cursor="hand2",
+                           highlightbackground=GOLD, highlightthickness=1)
+        lb_card.pack(padx=50, pady=4, fill="x")
+        lb_card.bind("<Enter>", lambda e: lb_card.config(highlightbackground=WARNING))
+        lb_card.bind("<Leave>", lambda e: lb_card.config(highlightbackground=GOLD))
+        lb_inner = tk.Frame(lb_card, bg=CARD)
+        lb_inner.pack(padx=14, pady=9, fill="x")
+        n_local  = len(self.db.scores())
+        src_lbl  = ("Live -- " + self._remote.base) if has_remote \
+                   else f"Local  ({n_local} scores)"
+        tk.Label(lb_inner, text="Leaderboard", font=self.fS,
                  bg=CARD, fg=GOLD, anchor="w").pack(anchor="w")
-        tk.Label(lb_inn, text=src_lbl, font=self.fX, bg=CARD,
+        tk.Label(lb_inner, text=src_lbl, font=self.fX, bg=CARD,
                  fg=INFO if has_remote else MUTED, anchor="w").pack(anchor="w", pady=(2, 0))
-        for w in [lb_f, lb_inn] + list(lb_inn.winfo_children()):
+        for w in [lb_card, lb_inner] + list(lb_inner.winfo_children()):
             w.bind("<Button-1>", lambda e: self._leaderboard())
 
         tk.Label(self.root,
@@ -576,174 +819,271 @@ class App:
                  font=self.fX, bg=BG, fg=MUTED).pack(pady=(8, 0))
 
     # -----------------------------------------------------------------------
-    #  Server URL bar
+    # Account bar -- shows server URL or logged-in user info
     # -----------------------------------------------------------------------
 
-    def _build_server_bar(self):
-        sf = tk.Frame(self.root, bg=CARD, highlightbackground=ACCENT, highlightthickness=1)
-        sf.pack(padx=50, pady=(0, 4), fill="x")
-        inner = tk.Frame(sf, bg=CARD)
+    def _build_account_bar(self):
+        bar = tk.Frame(self.root, bg=CARD,
+                       highlightbackground=ACCENT, highlightthickness=1)
+        bar.pack(padx=50, pady=(0, 4), fill="x")
+        inner = tk.Frame(bar, bg=CARD)
         inner.pack(padx=12, pady=8, fill="x")
 
-        connected = self._remote and bool(self._remote.base)
-        dot_col   = SUCCESS if connected else MUTED
-        dot_txt   = ("Connected  --  " + self._remote.base) if connected else "No server -- local scores only"
+        has_remote = self._remote and bool(self._remote.base)
+        logged_in  = bool(self._logged_in_user)
 
-        tk.Label(inner, text=dot_txt, font=self.fX, bg=CARD,
-                 fg=dot_col).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        if not has_remote:
+            # no server -- show URL entry
+            tk.Label(inner, text="No server -- local scores only",
+                     font=self.fX, bg=CARD, fg=MUTED).grid(
+                     row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+            tk.Label(inner, text="Server URL:", font=self.fX, bg=CARD,
+                     fg=MUTED).grid(row=1, column=0, sticky="w", padx=(0, 6))
+            self._srv_url_var = tk.StringVar(value="")
+            tk.Entry(inner, textvariable=self._srv_url_var, font=self.fX,
+                     bg=ACCENT, fg=TEXT, insertbackground=TEXT,
+                     relief="flat", width=34).grid(row=1, column=1, ipady=4, padx=(0, 8))
+            tk.Button(inner, text="Connect", font=self.fX,
+                      bg=INFO, fg="white", relief="flat", cursor="hand2",
+                      padx=10, pady=3,
+                      command=self._connect_server).grid(row=1, column=2)
 
-        tk.Label(inner, text="Server URL:", font=self.fX, bg=CARD,
-                 fg=MUTED).grid(row=1, column=0, sticky="w", padx=(0, 6))
+        elif not logged_in:
+            # server connected but not logged in
+            tk.Label(inner,
+                     text=f"Connected  --  {self._remote.base}",
+                     font=self.fX, bg=CARD, fg=SUCCESS).grid(
+                     row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+            tk.Label(inner, text="Not logged in  --  scores won't be linked to an account",
+                     font=self.fX, bg=CARD, fg=WARNING).grid(
+                     row=1, column=0, columnspan=2, sticky="w")
+            tk.Button(inner, text="Log In", font=self.fX,
+                      bg=INFO, fg="white", relief="flat", cursor="hand2",
+                      padx=10, pady=3,
+                      command=lambda: self._show_auth_dialog("login")).grid(
+                      row=1, column=2, padx=(8, 4))
+            tk.Button(inner, text="Register", font=self.fX,
+                      bg=SUCCESS, fg="#071a0b", relief="flat", cursor="hand2",
+                      padx=10, pady=3,
+                      command=lambda: self._show_auth_dialog("register")).grid(
+                      row=1, column=3)
 
-        self._srv_url_var = tk.StringVar(
-            value=self._remote.base if self._remote else "")
-        url_entry = tk.Entry(inner, textvariable=self._srv_url_var, font=self.fX,
-                             bg=ACCENT, fg=TEXT, insertbackground=TEXT,
-                             relief="flat", width=34)
-        url_entry.grid(row=1, column=1, ipady=4, padx=(0, 8))
-
-        tk.Button(inner, text="Connect", font=self.fX,
-                  bg=INFO, fg="white", relief="flat", cursor="hand2",
-                  padx=10, pady=3,
-                  command=self._connect_server).grid(row=1, column=2)
-
-        if connected:
-            tk.Button(inner, text="Disconnect", font=self.fX,
+        else:
+            # logged in -- show user info
+            tk.Label(inner,
+                     text=f"Logged in as  {self._logged_in_user}  --  {self._remote.base}",
+                     font=self.fX, bg=CARD, fg=SUCCESS).grid(
+                     row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+            tk.Button(inner, text="My History", font=self.fX,
+                      bg=ACCENT, fg=TEXT, relief="flat", cursor="hand2",
+                      padx=10, pady=3,
+                      command=self._show_profile).grid(row=1, column=0, padx=(0, 8))
+            tk.Label(inner, text="", bg=CARD).grid(row=1, column=1,
+                     sticky="ew")   # spacer
+            inner.columnconfigure(1, weight=1)
+            tk.Button(inner, text="Log Out", font=self.fX,
                       bg=ERROR, fg="white", relief="flat", cursor="hand2",
                       padx=10, pady=3,
-                      command=self._disconnect_server).grid(row=1, column=3, padx=(6, 0))
+                      command=self._logout).grid(row=1, column=2)
 
     def _connect_server(self):
-        self._update_player()
         url = self._srv_url_var.get().strip()
         if not url:
             messagebox.showwarning("No URL", "Please enter the server URL.")
             return
 
-        # Test in background so the UI doesn't freeze
         def _try():
             client = RemoteClient(url)
             ok     = client.ping()
             def _done():
                 if ok:
-                    self._remote     = client
+                    self._remote       = client
                     self.db.server_url = client.base
                     self._menu()
                 else:
                     messagebox.showerror(
                         "Cannot Connect",
                         f"Could not reach:\n{client.base}\n\n"
-                        "Make sure the server is running and the URL is correct.\n"
-                        "Check server.py for deploy instructions.")
+                        "Make sure the server is running and the URL is correct.")
             self.root.after(0, _done)
         threading.Thread(target=_try, daemon=True).start()
 
-    def _disconnect_server(self):
-        self._remote       = None
-        self.db.server_url = ""
-        self._menu()
-
     # -----------------------------------------------------------------------
-    #  Score submission  (local always; remote when connected)
+    # Score submission -- local always, server when logged in
     # -----------------------------------------------------------------------
 
     def _submit_score(self, player, mode, score, total):
         self.db.add(player, mode, score, total)
         if self._remote and self._remote.base:
+            token = self._token  # may be None for guests -- server handles both
             threading.Thread(
                 target=self._remote.post_score,
-                args=(player, mode, score, total),
+                args=(player, mode, score, total, token),
                 daemon=True).start()
 
     def _update_player(self):
-        name = self._player_var.get().strip() if hasattr(self, "_player_var") else self._player
-        self._player = name
-        if name:
-            self.db.last_player = name
+        """Keep _player in sync. For logged in users the name is locked to the username."""
+        if self._logged_in_user:
+            self._player = self._logged_in_user
+        elif hasattr(self, "_player_var"):
+            name = self._player_var.get().strip()
+            self._player = name
+            if name:
+                self.db.last_player = name
 
     # -----------------------------------------------------------------------
-    #  LEADERBOARD  (Treeview + live polling)
+    # Profile screen -- personal attempt history
+    # -----------------------------------------------------------------------
+
+    def _show_profile(self):
+        if not self._logged_in_user or not self._remote:
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title(f"{self._logged_in_user}'s History")
+        win.configure(bg=BG)
+        win.geometry("860x600")
+        win.grab_set()
+
+        tk.Label(win, text=f"{self._logged_in_user}'s History",
+                 font=self.fT, bg=BG, fg=TEXT).pack(pady=(18, 2))
+        tk.Label(win, text="Every quiz you've completed on this server.",
+                 font=self.fX, bg=BG, fg=MUTED).pack(pady=(0, 8))
+
+        # tabs per mode
+        tabs = ttk.Notebook(win)
+        tabs.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+        tab_defs = [
+            ("All",         None),
+            ("Flag Quiz",   ScoreDB.MODE_FLAG),
+            ("All 197",     ScoreDB.MODE_ALL),
+            ("Map Fill",    ScoreDB.MODE_MAP),
+            ("Map + Flags", ScoreDB.MODE_MAPFLAG),
+        ]
+        trees = {}
+        for label, mode_filter in tab_defs:
+            tab  = tk.Frame(tabs, bg=BG)
+            tabs.add(tab, text=f"  {label}  ")
+            trees[mode_filter] = self._lb_make_tree(tab, show_player=False)
+
+        status_var = tk.StringVar(value="Loading...")
+        tk.Label(win, textvariable=status_var, font=self.fX,
+                 bg=BG, fg=MUTED).pack(pady=(0, 4))
+
+        def _load():
+            rows = self._remote.get_profile(self._logged_in_user)
+            def _done():
+                if rows is None:
+                    status_var.set("Could not load history -- check your connection.")
+                    return
+                status_var.set(f"{len(rows)} attempts total")
+                for mode_filter, tree in trees.items():
+                    filtered = [r for r in rows if mode_filter is None
+                                or r.get("mode") == mode_filter]
+                    # newest first for personal history
+                    self._lb_fill_tree(tree, filtered, sort_by_date=True)
+            self.root.after(0, _done)
+        threading.Thread(target=_load, daemon=True).start()
+
+        tk.Button(win, text="Close", font=self.fX, bg=ACCENT, fg=TEXT,
+                  relief="flat", cursor="hand2", padx=16, pady=8,
+                  command=win.destroy).pack(pady=(0, 12))
+
+    # -----------------------------------------------------------------------
+    # LEADERBOARD -- Treeview with live polling
     # -----------------------------------------------------------------------
 
     def _leaderboard(self):
-        self._update_player()
         if self._lb_win and self._lb_win.winfo_exists():
             self._lb_win.lift()
             return
 
-        rw = tk.Toplevel(self.root)
-        rw.title("Leaderboard")
-        rw.configure(bg=BG)
-        rw.geometry("880x640")
-        rw.grab_set()
-        self._lb_win = rw
-        rw.protocol("WM_DELETE_WINDOW",
-                     lambda: (self._lb_stop_poll(), rw.destroy()))
+        win = tk.Toplevel(self.root)
+        win.title("Leaderboard")
+        win.configure(bg=BG)
+        win.geometry("900x640")
+        win.grab_set()
+        self._lb_win = win
+        win.protocol("WM_DELETE_WINDOW",
+                     lambda: (self._lb_stop_poll(), win.destroy()))
 
-        tk.Label(rw, text="Leaderboard", font=self.fT, bg=BG, fg=GOLD).pack(pady=(18, 2))
+        tk.Label(win, text="Leaderboard", font=self.fT, bg=BG, fg=GOLD).pack(pady=(18, 2))
 
         has_remote = self._remote and bool(self._remote.base)
         status_txt = (f"Live  --  {self._remote.base}  (auto-refreshing every 5 s)"
                       if has_remote else "Local scores only")
         self._lb_status_var = tk.StringVar(value=status_txt)
-        tk.Label(rw, textvariable=self._lb_status_var, font=self.fX, bg=BG,
-                 fg=INFO if has_remote else MUTED).pack(pady=(0, 8))
+        tk.Label(win, textvariable=self._lb_status_var, font=self.fX, bg=BG,
+                 fg=INFO if has_remote else MUTED).pack(pady=(0, 4))
 
-        # Stats bar (only when remote connected)
         self._lb_stats_var = tk.StringVar(value="")
         if has_remote:
-            tk.Label(rw, textvariable=self._lb_stats_var, font=self.fX,
-                     bg=BG, fg=MUTED).pack(pady=(0, 4))
+            tk.Label(win, textvariable=self._lb_stats_var,
+                     font=self.fX, bg=BG, fg=MUTED).pack(pady=(0, 4))
 
-        nb = ttk.Notebook(rw)
-        nb.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        tabs = ttk.Notebook(win)
+        tabs.pack(fill="both", expand=True, padx=14, pady=(0, 8))
 
-        all_modes = [
-            ("All",          None),
-            ("Flag Quiz",    ScoreDB.MODE_FLAG),
-            ("All 197",      ScoreDB.MODE_ALL),
-            ("Map Fill",     ScoreDB.MODE_MAP),
-            ("Map + Flags",  ScoreDB.MODE_MAPFLAG),
+        tab_defs = [
+            ("All",         None),
+            ("Flag Quiz",   ScoreDB.MODE_FLAG),
+            ("All 197",     ScoreDB.MODE_ALL),
+            ("Map Fill",    ScoreDB.MODE_MAP),
+            ("Map + Flags", ScoreDB.MODE_MAPFLAG),
         ]
         self._lb_trees = {}
-        for label, mode_filter in all_modes:
-            tab  = tk.Frame(nb, bg=BG)
-            nb.add(tab, text=f"  {label}  ")
+        for label, mode_filter in tab_defs:
+            tab  = tk.Frame(tabs, bg=BG)
+            tabs.add(tab, text=f"  {label}  ")
             self._lb_trees[mode_filter] = self._lb_make_tree(tab)
 
         self._lb_populate_all()
 
         if has_remote:
-            self._lb_start_poll(rw)
-            # Fetch stats once in background
+            self._lb_start_poll(win)
             threading.Thread(target=self._lb_fetch_stats, daemon=True).start()
 
-        bf = tk.Frame(rw, bg=BG)
-        bf.pack(pady=(0, 12))
-        tk.Button(bf, text="Clear Local Scores", font=self.fX, bg=ERROR, fg="white",
+        btn_row = tk.Frame(win, bg=BG)
+        btn_row.pack(pady=(0, 12))
+        tk.Button(btn_row, text="Clear Local Scores", font=self.fX, bg=ERROR, fg="white",
                   relief="flat", cursor="hand2", padx=12, pady=6,
-                  command=lambda: self._lb_clear(rw)).pack(side="left", padx=8)
-        tk.Button(bf, text="Close", font=self.fX, bg=ACCENT, fg=TEXT,
+                  command=lambda: self._lb_clear(win)).pack(side="left", padx=8)
+        tk.Button(btn_row, text="Close", font=self.fX, bg=ACCENT, fg=TEXT,
                   relief="flat", cursor="hand2", padx=12, pady=6,
-                  command=lambda: (self._lb_stop_poll(), rw.destroy())).pack(side="left", padx=8)
+                  command=lambda: (self._lb_stop_poll(), win.destroy())).pack(side="left", padx=8)
 
-    def _lb_make_tree(self, parent):
+    def _lb_make_tree(self, parent, show_player=True):
+        """
+        Treeview with fixed columns.
+        show_player=False is used for the personal history view
+        where the player column is redundant.
+        """
         frame = tk.Frame(parent, bg=BG)
         frame.pack(fill="both", expand=True, padx=6, pady=6)
 
-        cols = ("rank", "player", "mode", "score", "pct", "date")
-        tree = ttk.Treeview(frame, columns=cols, show="headings",
-                            selectmode="none")
+        if show_player:
+            cols = ("rank", "player", "mode", "score", "pct", "date")
+            col_config = {
+                "rank":   ("#",      46,  "center"),
+                "player": ("Player", 190, "w"),
+                "mode":   ("Mode",   160, "w"),
+                "score":  ("Score",  90,  "center"),
+                "pct":    ("%",      60,  "center"),
+                "date":   ("Date",   100, "center"),
+            }
+        else:
+            cols = ("rank", "mode", "score", "pct", "date")
+            col_config = {
+                "rank":  ("#",     46,  "center"),
+                "mode":  ("Mode",  200, "w"),
+                "score": ("Score", 100, "center"),
+                "pct":   ("%",     70,  "center"),
+                "date":  ("Date",  120, "center"),
+            }
 
-        defs = {
-            "rank":   ("#",      46,  "center"),
-            "player": ("Player", 190, "w"),
-            "mode":   ("Mode",   170, "w"),
-            "score":  ("Score",  90,  "center"),
-            "pct":    ("%",      60,  "center"),
-            "date":   ("Date",   100, "center"),
-        }
-        for col, (heading, width, anchor) in defs.items():
+        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="none")
+        for col, (heading, width, anchor) in col_config.items():
             tree.heading(col, text=heading, anchor=anchor)
             tree.column(col,  width=width,  anchor=anchor,
                         minwidth=width, stretch=False)
@@ -754,19 +1094,17 @@ class App:
         tree.tag_configure("silv", background=CARD,      foreground=SILVER)
         tree.tag_configure("brnz", background=CARD,      foreground=BRONZE)
 
-        sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=sb.set)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
         tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
+        scrollbar.pack(side="right", fill="y")
         return tree
 
     def _lb_fetch_rows(self, mode_filter):
-        """Return rows from remote if connected, otherwise local."""
         if self._remote and self._remote.base:
             rows = self._remote.get_scores(mode=mode_filter)
             if rows is not None:
                 return rows
-            # Fall through to local on network error
         return self.db.top_scores(mode=mode_filter, n=200)
 
     def _lb_populate_all(self):
@@ -774,22 +1112,42 @@ class App:
             rows = self._lb_fetch_rows(mode_filter)
             self._lb_fill_tree(tree, rows)
 
-    def _lb_fill_tree(self, tree, rows):
+    def _lb_fill_tree(self, tree, rows, sort_by_date=False):
+        """
+        Fill a Treeview with score rows.
+        sort_by_date=True is used for the profile history view (newest first).
+        Default is rank order (by % desc).
+        """
         tree.delete(*tree.get_children())
-        medals = {1: "1st", 2: "2nd", 3: "3rd"}
-        for i, row in enumerate(rows, 1):
+        place_labels = {1: "1st", 2: "2nd", 3: "3rd"}
+
+        # detect whether this tree has a player column
+        has_player = "player" in tree["columns"]
+
+        for rank, row in enumerate(rows, 1):
             pct  = row.get("pct", 0)
             s, t = row.get("score", 0), row.get("total", 0)
-            tag  = {1: "gold", 2: "silv", 3: "brnz"}.get(i,
-                   "even" if i % 2 == 0 else "odd")
-            tree.insert("", "end", tags=(tag,), values=(
-                medals.get(i, str(i)),
-                row.get("player", "--"),
-                row.get("mode",   "--"),
-                f"{s} / {t}",
-                f"{pct}%",
-                row.get("date",  "--"),
-            ))
+            tag  = {1: "gold", 2: "silv", 3: "brnz"}.get(rank,
+                   "even" if rank % 2 == 0 else "odd")
+
+            if has_player:
+                values = (
+                    place_labels.get(rank, str(rank)),
+                    row.get("player", "--"),
+                    row.get("mode",   "--"),
+                    f"{s} / {t}",
+                    f"{pct}%",
+                    row.get("date",  "--"),
+                )
+            else:
+                values = (
+                    str(rank),
+                    row.get("mode",  "--"),
+                    f"{s} / {t}",
+                    f"{pct}%",
+                    row.get("date", "--"),
+                )
+            tree.insert("", "end", tags=(tag,), values=values)
 
     def _lb_fetch_stats(self):
         if not (self._remote and self._remote.base):
@@ -798,19 +1156,17 @@ class App:
         if not stats:
             return
         total   = stats.get("total_games", 0)
-        players = stats.get("unique_players", 0)
+        users   = stats.get("total_users", 0)
         top     = stats.get("top")
-        txt = f"{total} games played  |  {players} unique players"
+        txt = f"{total} games played  |  {users} registered players"
         if top:
             txt += f"  |  Top: {top['player']} ({top['pct']}%)"
-        def _set():
+        def _update():
             try:
                 self._lb_stats_var.set(txt)
             except Exception:
                 pass
-        self.root.after(0, _set)
-
-    # -- polling -----------------------------------------------------------
+        self.root.after(0, _update)
 
     def _lb_start_poll(self, win, interval_ms=5000):
         def poll():
@@ -843,7 +1199,7 @@ class App:
             self._lb_populate_all()
 
     # -----------------------------------------------------------------------
-    #  FLAG QUIZ SETUP
+    # FLAG QUIZ SETUP
     # -----------------------------------------------------------------------
 
     REGIONS = {
@@ -866,77 +1222,79 @@ class App:
         "Oceania":  {"au","fj","ki","mh","fm","nr","nz","pw","pg","ws","sb","to","tv","vu"},
     }
 
-    def _flag_setup(self, full):
+    def _flag_setup(self, full_mode):
         self._update_player()
         self._clear()
         self.root.geometry("520x450")
         tk.Label(self.root, text="Flag Quiz Setup",
                  font=self.fT, bg=BG, fg=TEXT).pack(pady=(30, 8))
 
-        if full:
+        if full_mode:
             tk.Label(self.root,
                      text=f"All {len(ALL_COUNTRIES)} countries, shown once each.",
                      font=self.fB, bg=BG, fg=MUTED, wraplength=440).pack(pady=(0, 18))
         else:
             tk.Label(self.root, text="How many questions?",
                      font=self.fB, bg=BG, fg=TEXT).pack(pady=(8, 6))
-            self._qv = tk.IntVar(value=10)
-            row = tk.Frame(self.root, bg=BG)
-            row.pack()
+            self._q_count_var = tk.IntVar(value=10)
+            btn_row = tk.Frame(self.root, bg=BG)
+            btn_row.pack()
             for n in [5, 10, 20, 50, len(ALL_COUNTRIES)]:
                 lbl = str(n) if n != len(ALL_COUNTRIES) else f"All {n}"
-                tk.Radiobutton(row, text=lbl, variable=self._qv, value=n,
+                tk.Radiobutton(btn_row, text=lbl, variable=self._q_count_var, value=n,
                                font=self.fB, bg=BG, fg=TEXT,
                                selectcolor=ACCENT, activebackground=BG).pack(
                                side="left", padx=8)
             tk.Label(self.root, text="-- or type a custom number --",
                      font=self.fX, bg=BG, fg=MUTED).pack(pady=(10, 2))
-            self._qe = tk.Entry(self.root, font=self.fB, bg=ACCENT, fg=TEXT,
-                                insertbackground=TEXT, width=6,
-                                justify="center", relief="flat")
-            self._qe.pack(ipady=6)
+            self._q_custom = tk.Entry(self.root, font=self.fB, bg=ACCENT, fg=TEXT,
+                                      insertbackground=TEXT, width=6,
+                                      justify="center", relief="flat")
+            self._q_custom.pack(ipady=6)
 
         tk.Label(self.root, text="Region filter:",
                  font=self.fB, bg=BG, fg=TEXT).pack(pady=(16, 4))
-        self._rv = tk.StringVar(value="All Regions")
-        ttk.Combobox(self.root, textvariable=self._rv,
+        self._region_var = tk.StringVar(value="All Regions")
+        ttk.Combobox(self.root, textvariable=self._region_var,
                      values=list(self.REGIONS.keys()),
                      state="readonly", font=self.fB, width=18).pack()
 
-        def start():
-            if full:
-                n, mode = len(ALL_COUNTRIES), ScoreDB.MODE_ALL
+        def start_quiz():
+            if full_mode:
+                count, mode = len(ALL_COUNTRIES), ScoreDB.MODE_ALL
             else:
-                cv   = self._qe.get().strip()
-                n    = int(cv) if cv.isdigit() and 1 <= int(cv) <= len(ALL_COUNTRIES) \
-                       else self._qv.get()
-                mode = ScoreDB.MODE_FLAG
-            pool   = ALL_COUNTRIES
-            rcodes = self.REGIONS.get(self._rv.get())
-            if rcodes:
-                pool = [(nm, co) for nm, co in ALL_COUNTRIES if co in rcodes] or pool
-            self._run_flag_quiz(random.sample(pool, min(n, len(pool))), mode=mode)
+                custom = self._q_custom.get().strip()
+                count  = int(custom) if custom.isdigit() and \
+                         1 <= int(custom) <= len(ALL_COUNTRIES) \
+                         else self._q_count_var.get()
+                mode   = ScoreDB.MODE_FLAG
+            pool         = ALL_COUNTRIES
+            region_codes = self.REGIONS.get(self._region_var.get())
+            if region_codes:
+                pool = [(nm, co) for nm, co in ALL_COUNTRIES
+                        if co in region_codes] or pool
+            self._run_flag_quiz(random.sample(pool, min(count, len(pool))), mode=mode)
 
-        bf = tk.Frame(self.root, bg=BG)
-        bf.pack(pady=22)
-        tk.Button(bf, text="Start", font=self.fS, bg=SUCCESS, fg="#071a0b",
+        btn_row = tk.Frame(self.root, bg=BG)
+        btn_row.pack(pady=22)
+        tk.Button(btn_row, text="Start", font=self.fS, bg=SUCCESS, fg="#071a0b",
                   relief="flat", cursor="hand2", padx=20, pady=10,
-                  command=start).pack(side="left", padx=10)
-        tk.Button(bf, text="Back", font=self.fS, bg=ACCENT, fg=TEXT,
+                  command=start_quiz).pack(side="left", padx=10)
+        tk.Button(btn_row, text="Back", font=self.fS, bg=ACCENT, fg=TEXT,
                   relief="flat", cursor="hand2", padx=16, pady=10,
                   command=self._menu).pack(side="left")
 
     # -----------------------------------------------------------------------
-    #  FLAG QUIZ GAME
+    # FLAG QUIZ -- game loop
     # -----------------------------------------------------------------------
 
-    def _run_flag_quiz(self, pool, recycled=False, mode=ScoreDB.MODE_FLAG):
+    def _run_flag_quiz(self, question_pool, recycled=False, mode=ScoreDB.MODE_FLAG):
         from collections import deque
         self._clear()
         self.root.geometry("600x780")
 
-        self._fq_queue    = deque(pool)
-        self._fq_total    = len(pool)
+        self._fq_queue    = deque(question_pool)
+        self._fq_total    = len(question_pool)
         self._fq_answered = 0
         self._fq_score    = 0
         self._fq_wrong    = []
@@ -948,53 +1306,53 @@ class App:
         hdr.pack(pady=(18, 4))
         tk.Label(hdr, text="Recycled Flags" if recycled else "Flag Quiz",
                  font=self.fT, bg=BG, fg=TEXT).pack()
-        self._fq_pv = tk.StringVar(value="")
-        tk.Label(hdr, textvariable=self._fq_pv,
+        self._fq_remaining_var = tk.StringVar(value="")
+        tk.Label(hdr, textvariable=self._fq_remaining_var,
                  font=self.fX, bg=BG, fg=MUTED).pack(pady=(2, 0))
 
         pb_bg = tk.Frame(self.root, bg=ACCENT, height=5, width=540)
         pb_bg.pack(pady=(0, 8))
-        self._fq_pb = tk.Frame(pb_bg, bg=HIGHLIGHT, height=5, width=0)
-        self._fq_pb.place(x=0, y=0)
+        self._fq_progress = tk.Frame(pb_bg, bg=HIGHLIGHT, height=5, width=0)
+        self._fq_progress.place(x=0, y=0)
 
-        fcard = tk.Frame(self.root, bg=CARD,
-                         highlightbackground=ACCENT, highlightthickness=2)
-        fcard.pack(padx=28, pady=4, fill="x")
-        tk.Label(fcard, text="Which country does this flag belong to?",
+        flag_card = tk.Frame(self.root, bg=CARD,
+                             highlightbackground=ACCENT, highlightthickness=2)
+        flag_card.pack(padx=28, pady=4, fill="x")
+        tk.Label(flag_card, text="Which country does this flag belong to?",
                  font=self.fS, bg=CARD, fg=TEXT,
                  wraplength=520, justify="center").pack(pady=(12, 8))
-        self._fq_fl = tk.Label(fcard, bg=CARD)
-        self._fq_fl.pack(pady=(0, 12))
+        self._fq_flag_img = tk.Label(flag_card, bg=CARD)
+        self._fq_flag_img.pack(pady=(0, 12))
 
-        ef = tk.Frame(self.root, bg=BG)
-        ef.pack(pady=8, padx=28, fill="x")
-        self._fq_ent = tk.Entry(ef, font=self.fB, bg=ACCENT, fg=TEXT,
-                                insertbackground=TEXT, relief="flat",
-                                highlightbackground=MUTED, highlightthickness=1)
-        self._fq_ent.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 8))
-        self._fq_sub = tk.Button(ef, text="Submit", font=self.fK,
-                                  bg=HIGHLIGHT, fg="white", relief="flat",
-                                  activebackground="#c73652", cursor="hand2",
-                                  padx=12, pady=6, command=self._fq_check)
-        self._fq_sub.pack(side="right")
+        input_row = tk.Frame(self.root, bg=BG)
+        input_row.pack(pady=8, padx=28, fill="x")
+        self._fq_input = tk.Entry(input_row, font=self.fB, bg=ACCENT, fg=TEXT,
+                                  insertbackground=TEXT, relief="flat",
+                                  highlightbackground=MUTED, highlightthickness=1)
+        self._fq_input.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 8))
+        self._fq_submit_btn = tk.Button(input_row, text="Submit", font=self.fK,
+                                        bg=HIGHLIGHT, fg="white", relief="flat",
+                                        activebackground="#c73652", cursor="hand2",
+                                        padx=12, pady=6, command=self._fq_check)
+        self._fq_submit_btn.pack(side="right")
 
-        self._fq_rl = tk.Label(self.root, text="", font=self.fB, bg=BG,
-                                fg=TEXT, wraplength=540, justify="center")
-        self._fq_rl.pack(pady=6, padx=20)
+        self._fq_feedback = tk.Label(self.root, text="", font=self.fB, bg=BG,
+                                     fg=TEXT, wraplength=540, justify="center")
+        self._fq_feedback.pack(pady=6, padx=20)
 
-        sf = tk.Frame(self.root, bg=CARD,
-                      highlightbackground=ACCENT, highlightthickness=1)
-        sf.pack(padx=28, fill="x")
-        self._fq_sl = tk.Label(sf, text="Score: 0 / 0",
-                                font=self.fK, bg=CARD, fg=TEXT, pady=8)
-        self._fq_sl.pack()
+        score_bar = tk.Frame(self.root, bg=CARD,
+                             highlightbackground=ACCENT, highlightthickness=1)
+        score_bar.pack(padx=28, fill="x")
+        self._fq_score_lbl = tk.Label(score_bar, text="Score: 0 / 0",
+                                      font=self.fK, bg=CARD, fg=TEXT, pady=8)
+        self._fq_score_lbl.pack()
 
-        ctrl = tk.Frame(self.root, bg=BG)
-        ctrl.pack(pady=8)
-        tk.Button(ctrl, text="Skip", font=self.fX, bg=ACCENT, fg=TEXT,
+        ctrl_row = tk.Frame(self.root, bg=BG)
+        ctrl_row.pack(pady=8)
+        tk.Button(ctrl_row, text="Skip", font=self.fX, bg=ACCENT, fg=TEXT,
                   relief="flat", cursor="hand2", padx=12, pady=6,
                   command=self._fq_skip).pack(side="left", padx=8)
-        tk.Button(ctrl, text="Menu", font=self.fX, bg=ACCENT, fg=TEXT,
+        tk.Button(ctrl_row, text="Menu", font=self.fX, bg=ACCENT, fg=TEXT,
                   relief="flat", cursor="hand2", padx=12, pady=6,
                   command=self._menu).pack(side="left")
 
@@ -1003,9 +1361,9 @@ class App:
 
     def _fq_widgets_alive(self):
         try:
-            return (self._fq_pb.winfo_exists() and
-                    self._fq_sl.winfo_exists() and
-                    self._fq_ent.winfo_exists())
+            return (self._fq_progress.winfo_exists() and
+                    self._fq_score_lbl.winfo_exists() and
+                    self._fq_input.winfo_exists())
         except Exception:
             return False
 
@@ -1022,20 +1380,22 @@ class App:
         self._fq_img  = None
         try:
             remaining = len(self._fq_queue)
-            self._fq_pv.set(f"{remaining} flag{'s' if remaining != 1 else ''} remaining")
-            self._fq_pb.config(
+            self._fq_remaining_var.set(
+                f"{remaining} flag{'s' if remaining != 1 else ''} remaining")
+            self._fq_progress.config(
                 width=int(540 * min(self._fq_answered, self._fq_total)
                           / max(self._fq_total, 1)))
-            self._fq_sl.config(text=f"Score: {self._fq_score} / {self._fq_answered}")
-            self._fq_rl.config(text="", fg=TEXT)
-            self._fq_ent.config(state="normal")
-            self._fq_ent.delete(0, tk.END)
-            self._fq_sub.config(state="normal")
-            self._fq_fl.config(image="", text="Loading...", fg=MUTED, font=self.fX)
+            self._fq_score_lbl.config(
+                text=f"Score: {self._fq_score} / {self._fq_answered}")
+            self._fq_feedback.config(text="", fg=TEXT)
+            self._fq_input.config(state="normal")
+            self._fq_input.delete(0, tk.END)
+            self._fq_submit_btn.config(state="normal")
+            self._fq_flag_img.config(image="", text="Loading...", fg=MUTED, font=self.fX)
         except tk.TclError:
             return
         threading.Thread(target=self._fq_fetch, args=(code,), daemon=True).start()
-        self._fq_ent.focus_set()
+        self._fq_input.focus_set()
 
     def _fq_fetch(self, code):
         try:
@@ -1045,17 +1405,17 @@ class App:
             self._fq_img = data
             def _show(p=photo):
                 try:
-                    if self._fq_fl.winfo_exists():
-                        self._fq_fl.config(image=p, text="")
-                        self._fq_fl.image = p
+                    if self._fq_flag_img.winfo_exists():
+                        self._fq_flag_img.config(image=p, text="")
+                        self._fq_flag_img.image = p
                 except tk.TclError:
                     pass
             self.root.after(0, _show)
         except Exception:
             def _err():
                 try:
-                    if self._fq_fl.winfo_exists():
-                        self._fq_fl.config(
+                    if self._fq_flag_img.winfo_exists():
+                        self._fq_flag_img.config(
                             text=f"Flag unavailable ({self._fq_code})",
                             fg=ERROR, font=self.fX)
                 except tk.TclError:
@@ -1065,108 +1425,114 @@ class App:
     def _fq_check(self):
         if self._fq_done:
             return
-        raw = self._fq_ent.get().strip()
+        raw = self._fq_input.get().strip()
         if not raw:
             return
         self._fq_done = True
-        self._fq_ent.config(state="disabled")
-        self._fq_sub.config(state="disabled")
+        self._fq_input.config(state="disabled")
+        self._fq_submit_btn.config(state="disabled")
         resolved = resolve(raw)
         correct  = self._fq_name
         self._fq_queue.popleft()
         self._fq_answered += 1
-
         if resolved.lower() == correct.lower():
             self._fq_score += 1
-            self._fq_rl.config(text=f"Correct!  It's {disp(correct)}.", fg=SUCCESS)
+            self._fq_feedback.config(
+                text=f"Correct!  It's {disp(correct)}.", fg=SUCCESS)
         else:
-            self._fq_rl.config(text=f"  {diff_hint(raw, disp(correct))}", fg=ERROR)
-            self._fq_wrong.append((self._fq_img, raw, disp(correct), self._fq_code))
-
-        self._fq_sl.config(text=f"Score: {self._fq_score} / {self._fq_answered}")
+            self._fq_feedback.config(
+                text=f"  {diff_hint(raw, disp(correct))}", fg=ERROR)
+            self._fq_wrong.append(
+                (self._fq_img, raw, disp(correct), self._fq_code))
+        self._fq_score_lbl.config(
+            text=f"Score: {self._fq_score} / {self._fq_answered}")
         self.root.after(2400, self._fq_load)
 
     def _fq_skip(self):
         if self._fq_done:
             return
         self._fq_done = True
-        self._fq_ent.config(state="disabled")
-        self._fq_sub.config(state="disabled")
+        self._fq_input.config(state="disabled")
+        self._fq_submit_btn.config(state="disabled")
         correct = self._fq_name
-        self._fq_rl.config(text=f"Skipped -- it was: {disp(correct)}", fg=WARNING)
+        self._fq_feedback.config(
+            text=f"Skipped -- it was: {disp(correct)}", fg=WARNING)
         self._fq_queue.popleft()
         self._fq_answered += 1
-        self._fq_wrong.append((self._fq_img, "(skipped)", disp(correct), self._fq_code))
-        self._fq_sl.config(text=f"Score: {self._fq_score} / {self._fq_answered}")
+        self._fq_wrong.append(
+            (self._fq_img, "(skipped)", disp(correct), self._fq_code))
+        self._fq_score_lbl.config(
+            text=f"Score: {self._fq_score} / {self._fq_answered}")
         self.root.after(2000, self._fq_load)
 
     def _fq_results(self):
         self.root.unbind("<Return>")
-
         if not self._fq_recycled and self._fq_answered:
-            self._submit_score(self._player or "Anonymous",
-                               self._fq_mode, self._fq_score, self._fq_answered)
+            self._submit_score(
+                self._player or "Anonymous",
+                self._fq_mode, self._fq_score, self._fq_answered)
 
         answered = self._fq_answered or 1
         pct      = int(self._fq_score / answered * 100)
-        grade, gcol = (
-            ("Perfect score!",    SUCCESS) if pct == 100 else
-            ("Great job!",        INFO)    if pct >= 80  else
-            ("Good effort!",      WARNING) if pct >= 60  else
-            ("Keep practising!",  MUTED)
+        grade, grade_colour = (
+            ("Perfect score!",   SUCCESS) if pct == 100 else
+            ("Great job!",       INFO)    if pct >= 80  else
+            ("Good effort!",     WARNING) if pct >= 60  else
+            ("Keep practising!", MUTED)
         )
+        win = tk.Toplevel(self.root)
+        win.title("Results")
+        win.configure(bg=BG)
+        win.geometry("660x700")
+        win.grab_set()
 
-        rw = tk.Toplevel(self.root)
-        rw.title("Results")
-        rw.configure(bg=BG)
-        rw.geometry("660x700")
-        rw.grab_set()
-
-        tk.Label(rw, text="Quiz Complete!", font=self.fT, bg=BG, fg=TEXT).pack(pady=(22, 2))
-        tk.Label(rw, text=grade, font=self.fS, bg=BG, fg=gcol).pack()
-        tk.Label(rw,
+        tk.Label(win, text="Quiz Complete!", font=self.fT, bg=BG, fg=TEXT).pack(pady=(22, 2))
+        tk.Label(win, text=grade, font=self.fS, bg=BG, fg=grade_colour).pack()
+        tk.Label(win,
                  text=f"You scored  {self._fq_score} / {self._fq_answered}  ({pct}%)",
                  font=self.fB, bg=BG, fg=TEXT).pack(pady=(4, 2))
         if not self._fq_recycled and self._fq_answered:
-            saved_to = ("server + local" if (self._remote and self._remote.base)
-                        else "local only")
-            tk.Label(rw,
-                     text=f"Score saved  ({saved_to})  for {self._player or 'Anonymous'}",
-                     font=self.fX, bg=BG, fg=INFO).pack(pady=(0, 8))
+            if self._logged_in_user:
+                saved_note = f"Saved to your account  ({self._logged_in_user})"
+            elif self._remote and self._remote.base:
+                saved_note = "Saved locally (not logged in -- score not on server)"
+            else:
+                saved_note = "Saved locally only"
+            tk.Label(win, text=saved_note, font=self.fX, bg=BG, fg=INFO).pack(pady=(0, 8))
 
-        wrong = self._fq_wrong
-        if not wrong:
-            tk.Label(rw, text="Flawless -- no mistakes!",
+        missed = self._fq_wrong
+        if not missed:
+            tk.Label(win, text="Flawless -- no mistakes!",
                      font=self.fB, bg=BG, fg=SUCCESS).pack(pady=12)
         else:
-            tk.Label(rw, text=f"Mistakes / Skips  ({len(wrong)})",
+            tk.Label(win, text=f"Mistakes / Skips  ({len(missed)})",
                      font=self.fS, bg=BG, fg=ERROR).pack()
-            self._scrollable_wrong_list(rw, wrong)
+            self._scrollable_wrong_list(win, missed)
 
-        bf = tk.Frame(rw, bg=BG)
-        bf.pack(pady=10)
-        if wrong:
-            recycle_pool = [(w[2], w[3]) for w in wrong]
+        btn_row = tk.Frame(win, bg=BG)
+        btn_row.pack(pady=10)
+        if missed:
+            recycle_pool = [(w[2], w[3]) for w in missed]
             disp_to_py   = {v: k for k, v in DISPLAY.items()}
             recycle_pool = [(disp_to_py.get(nm, nm), co) for nm, co in recycle_pool]
             def do_recycle():
-                rw.destroy()
+                win.destroy()
                 random.shuffle(recycle_pool)
                 self._run_flag_quiz(recycle_pool, recycled=True)
-            tk.Button(bf,
-                      text=f"Retry {len(wrong)} missed flag{'s' if len(wrong)!=1 else ''}",
+            tk.Button(btn_row,
+                      text=f"Retry {len(missed)} missed flag{'s' if len(missed) != 1 else ''}",
                       font=self.fS, bg=WARNING, fg="#1a0f00",
                       relief="flat", cursor="hand2", padx=16, pady=10,
                       command=do_recycle).pack(side="left", padx=8)
-        tk.Button(bf, text="Leaderboard", font=self.fS, bg=GOLD, fg="#1a0f00",
+        tk.Button(btn_row, text="Leaderboard", font=self.fS, bg=GOLD, fg="#1a0f00",
                   relief="flat", cursor="hand2", padx=16, pady=10,
-                  command=lambda: (rw.destroy(), self._leaderboard())).pack(
+                  command=lambda: (win.destroy(), self._leaderboard())).pack(
                   side="left", padx=8)
-        tk.Button(bf, text="Main Menu", font=self.fS, bg=HIGHLIGHT, fg="white",
+        tk.Button(btn_row, text="Main Menu", font=self.fS, bg=HIGHLIGHT, fg="white",
                   relief="flat", cursor="hand2", padx=16, pady=10,
-                  command=lambda: (rw.destroy(), self._menu())).pack(side="left", padx=8)
+                  command=lambda: (win.destroy(), self._menu())).pack(side="left", padx=8)
 
-    def _scrollable_wrong_list(self, parent, wrong_list):
+    def _scrollable_wrong_list(self, parent, missed_list):
         outer = tk.Frame(parent, bg=BG)
         outer.pack(fill="both", expand=True, padx=20, pady=8)
         cv = tk.Canvas(outer, bg=BG, highlightthickness=0)
@@ -1177,15 +1543,16 @@ class App:
         cv.configure(yscrollcommand=sb.set)
         cv.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        for img_b, guess, correct, code in wrong_list:
+        for img_bytes, guess, correct, code in missed_list:
             row = tk.Frame(sf, bg=CARD,
                            highlightbackground=ACCENT, highlightthickness=1)
             row.pack(fill="x", pady=5, padx=4)
-            if img_b:
+            if img_bytes:
                 try:
-                    tp = ImageTk.PhotoImage(Image.open(BytesIO(img_b)).resize((110, 68)))
-                    fl = tk.Label(row, image=tp, bg=CARD)
-                    fl.image = tp
+                    thumb = ImageTk.PhotoImage(
+                        Image.open(BytesIO(img_bytes)).resize((110, 68)))
+                    fl = tk.Label(row, image=thumb, bg=CARD)
+                    fl.image = thumb
                     fl.pack(side="left", padx=10, pady=8)
                 except Exception:
                     pass
@@ -1198,7 +1565,7 @@ class App:
                      anchor="w", pady=(3, 0))
 
     # -----------------------------------------------------------------------
-    #  MAP -- LOADING
+    # MAP -- loading
     # -----------------------------------------------------------------------
 
     def _launch_map(self, use_flags):
@@ -1207,8 +1574,8 @@ class App:
         self.root.geometry("500x300")
         tk.Label(self.root, text="Loading Map...",
                  font=self.fT, bg=BG, fg=TEXT).pack(pady=(60, 16))
-        self._map_stat = tk.StringVar(value="Connecting...")
-        tk.Label(self.root, textvariable=self._map_stat,
+        self._map_status = tk.StringVar(value="Connecting...")
+        tk.Label(self.root, textvariable=self._map_status,
                  font=self.fB, bg=BG, fg=MUTED).pack()
         pb_bg = tk.Frame(self.root, bg=ACCENT, height=6, width=380)
         pb_bg.pack(pady=20)
@@ -1217,9 +1584,9 @@ class App:
 
         def do_load():
             try:
-                stop = [False]
+                stop_pulse = [False]
                 def pulse(n=0):
-                    if stop[0]:
+                    if stop_pulse[0]:
                         return
                     try:
                         self._load_pb.config(width=int(380 * abs(math.sin(n * 0.15))))
@@ -1230,11 +1597,11 @@ class App:
                 self.root.after(0, pulse)
                 self._geo = load_geojson(
                     on_progress=lambda s: self.root.after(
-                        0, lambda: self._map_stat.set(s)))
-                stop[0] = True
+                        0, lambda: self._map_status.set(s)))
+                stop_pulse[0] = True
                 self.root.after(0, lambda: self._map_mode(use_flags))
             except Exception as e:
-                stop[0] = True
+                stop_pulse[0] = True
                 self.root.after(0, lambda: (
                     messagebox.showerror("Network Error",
                         f"Could not download map data:\n{e}"),
@@ -1242,7 +1609,7 @@ class App:
         threading.Thread(target=do_load, daemon=True).start()
 
     # -----------------------------------------------------------------------
-    #  MAP MODE
+    # MAP -- game screen
     # -----------------------------------------------------------------------
 
     def _map_mode(self, use_flags):
@@ -1277,19 +1644,19 @@ class App:
                  justify="left").pack(pady=(0, 6))
 
         if use_flags:
-            self._mp_flag_lbl     = tk.Label(left, bg=BG, text="", fg=MUTED, font=self.fX)
-            self._mp_flag_lbl.pack(pady=4)
+            self._mp_flag_display = tk.Label(left, bg=BG, text="", fg=MUTED, font=self.fX)
+            self._mp_flag_display.pack(pady=4)
             self._mp_flag_counter = tk.Label(left, text="", font=self.fX, bg=BG, fg=MUTED)
             self._mp_flag_counter.pack()
 
-        ef = tk.Frame(left, bg=BG)
-        ef.pack(fill="x", pady=(8, 4), padx=4)
-        self._mp_ent = tk.Entry(ef, font=self.fB, bg=ACCENT, fg=TEXT,
-                                insertbackground=TEXT, relief="flat",
-                                highlightbackground=MUTED, highlightthickness=1)
-        self._mp_ent.pack(fill="x", ipady=7)
-        self._mp_ent.bind("<Return>", lambda e: self._mp_submit())
-        self._mp_ent.focus_set()
+        input_frame = tk.Frame(left, bg=BG)
+        input_frame.pack(fill="x", pady=(8, 4), padx=4)
+        self._mp_input = tk.Entry(input_frame, font=self.fB, bg=ACCENT, fg=TEXT,
+                                  insertbackground=TEXT, relief="flat",
+                                  highlightbackground=MUTED, highlightthickness=1)
+        self._mp_input.pack(fill="x", ipady=7)
+        self._mp_input.bind("<Return>", lambda e: self._mp_submit())
+        self._mp_input.focus_set()
 
         btn_row = tk.Frame(left, bg=BG)
         btn_row.pack(fill="x", padx=4, pady=(0, 4))
@@ -1302,37 +1669,37 @@ class App:
                       relief="flat", cursor="hand2", pady=6, padx=6,
                       command=self._mp_skip_flag).pack(side="left")
 
-        self._mp_fb  = tk.Label(left, text="", font=self.fX, bg=BG, fg=TEXT,
-                                wraplength=210, justify="left")
-        self._mp_fb.pack(pady=4, padx=4)
-        self._mp_scl = tk.Label(left, text=f"Found: 0 / {self._mp_total}",
-                                font=self.fK, bg=BG, fg=TEXT)
-        self._mp_scl.pack(pady=4)
+        self._mp_feedback = tk.Label(left, text="", font=self.fX, bg=BG, fg=TEXT,
+                                     wraplength=210, justify="left")
+        self._mp_feedback.pack(pady=4, padx=4)
+        self._mp_score_lbl = tk.Label(left, text=f"Found: 0 / {self._mp_total}",
+                                      font=self.fK, bg=BG, fg=TEXT)
+        self._mp_score_lbl.pack(pady=4)
 
         pb_bg = tk.Frame(left, bg=ACCENT, height=5, width=210)
         pb_bg.pack(pady=(0, 4))
-        self._mp_pb = tk.Frame(pb_bg, bg=SUCCESS, height=5, width=0)
-        self._mp_pb.place(x=0, y=0)
+        self._mp_progress = tk.Frame(pb_bg, bg=SUCCESS, height=5, width=0)
+        self._mp_progress.place(x=0, y=0)
 
-        leg = tk.Frame(left, bg=BG)
-        leg.pack(pady=4, padx=4, fill="x")
-        for col, lbl in [(MAP_FOUND, "Guessed"), (MAP_LAND, "Not yet"),
-                         (MAP_MISS,  "Missed")]:
-            r = tk.Frame(leg, bg=BG)
-            r.pack(anchor="w", pady=1)
-            tk.Frame(r, bg=col, width=13, height=13).pack(side="left", padx=(0, 5))
-            tk.Label(r, text=lbl, font=self.fX, bg=BG, fg=MUTED).pack(side="left")
+        legend = tk.Frame(left, bg=BG)
+        legend.pack(pady=4, padx=4, fill="x")
+        for colour, label in [(MAP_FOUND, "Guessed"), (MAP_LAND, "Not yet"),
+                              (MAP_MISS,  "Missed")]:
+            row = tk.Frame(legend, bg=BG)
+            row.pack(anchor="w", pady=1)
+            tk.Frame(row, bg=colour, width=13, height=13).pack(side="left", padx=(0, 5))
+            tk.Label(row, text=label, font=self.fX, bg=BG, fg=MUTED).pack(side="left")
 
         tk.Frame(left, bg=BG).pack(expand=True, fill="both")
 
-        bf = tk.Frame(left, bg=BG)
-        bf.pack(fill="x", padx=4, pady=(0, 4), side="bottom")
+        bottom_btns = tk.Frame(left, bg=BG)
+        bottom_btns.pack(fill="x", padx=4, pady=(0, 4), side="bottom")
         self._mp_finish_btn = tk.Button(
-            bf, text="Finish & Results", font=self.fX,
+            bottom_btns, text="Finish & Results", font=self.fX,
             bg=SUCCESS, fg="#071a0b", relief="flat", cursor="hand2", pady=6,
             command=self._mp_finish)
         self._mp_finish_btn.pack(fill="x", pady=(0, 4))
-        tk.Button(bf, text="Menu", font=self.fX, bg=ACCENT, fg=TEXT,
+        tk.Button(bottom_btns, text="Menu", font=self.fX, bg=ACCENT, fg=TEXT,
                   relief="flat", cursor="hand2", pady=5,
                   command=self._menu).pack(fill="x")
 
@@ -1344,9 +1711,9 @@ class App:
 
         tk.Label(right, text="Guessed", font=self.fS,
                  bg=BG, fg=SUCCESS).pack(pady=(8, 4))
-        self._mp_gl_count = tk.Label(right, text="0 countries",
-                                     font=self.fX, bg=BG, fg=MUTED)
-        self._mp_gl_count.pack()
+        self._mp_guessed_count = tk.Label(right, text="0 countries",
+                                          font=self.fX, bg=BG, fg=MUTED)
+        self._mp_guessed_count.pack()
 
         gl_outer = tk.Frame(right, bg=BG)
         gl_outer.pack(fill="both", expand=True, pady=4)
@@ -1356,33 +1723,33 @@ class App:
                           yscrollcommand=gl_sb.set)
         gl_cv.pack(side="left", fill="both", expand=True)
         gl_sb.config(command=gl_cv.yview)
-        self._mp_gl_frame = tk.Frame(gl_cv, bg=BG)
-        win = gl_cv.create_window((0, 0), window=self._mp_gl_frame, anchor="nw")
+        self._mp_guessed_frame = tk.Frame(gl_cv, bg=BG)
+        win_id = gl_cv.create_window((0, 0), window=self._mp_guessed_frame, anchor="nw")
         gl_cv.bind("<Configure>",
-                   lambda e, cv=gl_cv, w=win: cv.itemconfig(w, width=e.width))
-        self._mp_gl_frame.bind(
+                   lambda e, cv=gl_cv, w=win_id: cv.itemconfig(w, width=e.width))
+        self._mp_guessed_frame.bind(
             "<Configure>",
             lambda e, cv=gl_cv: cv.configure(scrollregion=cv.bbox("all")))
-        def _gl_wheel(e, cv=gl_cv):
+        def _scroll(e, cv=gl_cv):
             cv.yview_scroll(-1 if (e.num == 4 or e.delta > 0) else 1, "units")
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            gl_cv.bind(seq, _gl_wheel)
-            self._mp_gl_frame.bind(seq, _gl_wheel)
-            right.bind(seq, _gl_wheel)
-        self._mp_gl_canvas = gl_cv
+            gl_cv.bind(seq, _scroll)
+            self._mp_guessed_frame.bind(seq, _scroll)
+            right.bind(seq, _scroll)
+        self._mp_guessed_canvas = gl_cv
 
         if use_flags:
             self._mp_next_flag()
 
     def _mp_add_guessed_row(self, code, name, flag_img):
-        row = tk.Frame(self._mp_gl_frame, bg=CARD,
+        row = tk.Frame(self._mp_guessed_frame, bg=CARD,
                        highlightbackground=MAP_FOUND2, highlightthickness=1)
         row.pack(fill="x", pady=2, padx=3, side="top", anchor="n")
         if flag_img:
             try:
-                ph = ImageTk.PhotoImage(flag_img.resize((36, 22)))
-                fl = tk.Label(row, image=ph, bg=CARD)
-                fl.image = ph
+                thumb = ImageTk.PhotoImage(flag_img.resize((36, 22)))
+                fl = tk.Label(row, image=thumb, bg=CARD)
+                fl.image = thumb
                 fl.pack(side="left", padx=4, pady=3)
             except Exception:
                 pass
@@ -1390,17 +1757,17 @@ class App:
                  anchor="w", wraplength=148).pack(
                  side="left", padx=4, pady=3, fill="x", expand=True)
         n = len(self._mp_found)
-        self._mp_gl_count.config(
+        self._mp_guessed_count.config(
             text=f"{n} countr{'y' if n == 1 else 'ies'}")
-        self.root.after(10, lambda: self._mp_gl_canvas.yview_moveto(1.0))
+        self.root.after(10, lambda: self._mp_guessed_canvas.yview_moveto(1.0))
 
     def _mp_submit(self):
         if self._mp_finished:
             return
-        raw = self._mp_ent.get().strip()
+        raw = self._mp_input.get().strip()
         if not raw:
             return
-        self._mp_ent.delete(0, tk.END)
+        self._mp_input.delete(0, tk.END)
         resolved = resolve(raw)
 
         matched_code = matched_name = None
@@ -1413,13 +1780,14 @@ class App:
         if matched_code:
             if self._mp_flags and self._mp_cur_code:
                 if matched_code != self._mp_cur_code:
-                    self._mp_fb.config(text="Not this one -- try again!", fg=ERROR)
+                    self._mp_feedback.config(
+                        text="Not this one -- try again!", fg=ERROR)
                     return
             del self._mp_remain[matched_code]
-            self._mp_fb.config(text=f"{disp(matched_name)}!", fg=SUCCESS)
-            n = self._mp_total - len(self._mp_remain)
-            self._mp_scl.config(text=f"Found: {n} / {self._mp_total}")
-            self._mp_pb.config(width=int(210 * n / self._mp_total))
+            self._mp_feedback.config(text=f"{disp(matched_name)}!", fg=SUCCESS)
+            n_found = self._mp_total - len(self._mp_remain)
+            self._mp_score_lbl.config(text=f"Found: {n_found} / {self._mp_total}")
+            self._mp_progress.config(width=int(210 * n_found / self._mp_total))
 
             def _fetch_and_add(c=matched_code, nm=matched_name):
                 try:
@@ -1437,32 +1805,33 @@ class App:
             if not self._mp_remain:
                 self.root.after(1200, self._mp_finish)
         else:
-            self._mp_fb.config(
+            self._mp_feedback.config(
                 text="Not recognised -- try again!" if (self._mp_flags and self._mp_cur_code)
                 else "Not found or already placed.", fg=ERROR)
 
     def _mp_skip_flag(self):
         if not self._mp_cur_code:
             return
-        self._mp_ent.delete(0, tk.END)
+        self._mp_input.delete(0, tk.END)
         remaining = [(c, n) for c, n in self._mp_remain.items()
                      if c != self._mp_cur_code]
         if not remaining:
-            self._mp_fb.config(text="Only one left!", fg=WARNING)
+            self._mp_feedback.config(text="Only one left!", fg=WARNING)
             return
         code, _ = random.choice(remaining)
         self._mp_cur_code = code
-        self._mp_fb.config(text="New flag...", fg=MUTED)
+        self._mp_feedback.config(text="New flag...", fg=MUTED)
         n_found = self._mp_total - len(self._mp_remain)
         self._mp_flag_counter.config(
             text=f"{n_found} placed / {len(self._mp_remain)} remaining")
-        self._mp_flag_lbl.config(image="", text="...", fg=MUTED, font=self.fX)
+        self._mp_flag_display.config(image="", text="...", fg=MUTED, font=self.fX)
         threading.Thread(target=self._mp_load_flag, args=(code,), daemon=True).start()
 
     def _mp_next_flag(self):
         if not self._mp_remain:
             try:
-                self._mp_flag_lbl.config(image="", text="All done!", fg=SUCCESS, font=self.fS)
+                self._mp_flag_display.config(
+                    image="", text="All done!", fg=SUCCESS, font=self.fS)
             except Exception:
                 pass
             return
@@ -1472,7 +1841,7 @@ class App:
         try:
             self._mp_flag_counter.config(
                 text=f"{n_found} placed / {len(self._mp_remain)} remaining")
-            self._mp_flag_lbl.config(image="", text="...", fg=MUTED, font=self.fX)
+            self._mp_flag_display.config(image="", text="...", fg=MUTED, font=self.fX)
         except Exception:
             pass
         threading.Thread(target=self._mp_load_flag, args=(code,), daemon=True).start()
@@ -1482,7 +1851,7 @@ class App:
             data  = fetch_bytes(f"https://flagcdn.com/w160/{code}.png")
             img   = Image.open(BytesIO(data)).resize((200, 124))
             photo = ImageTk.PhotoImage(img)
-            def _set(lbl=self._mp_flag_lbl, p=photo):
+            def _set(lbl=self._mp_flag_display, p=photo):
                 try:
                     if lbl.winfo_exists():
                         lbl.config(image=p, text="")
@@ -1491,7 +1860,7 @@ class App:
                     pass
             self.root.after(0, _set)
         except Exception:
-            def _err(lbl=self._mp_flag_lbl):
+            def _err(lbl=self._mp_flag_display):
                 try:
                     if lbl.winfo_exists():
                         lbl.config(text="Flag unavailable", fg=ERROR, font=self.fX)
@@ -1527,12 +1896,12 @@ class App:
             y = int((90 - lat) / 180 * h)
             c.create_line(0, y, w, y, fill=MAP_GRID, width=1, dash=(2, 6))
 
-        n_f = len(self._mp_found)
-        n_m = len(self._mp_remain) if self._mp_finished else 0
-        legend = (f"{n_f} found  |  {n_m} missed -- hover for names"
-                  if self._mp_finished else f"{n_f} / {self._mp_total} placed")
-        c.create_rectangle(4, 4, len(legend) * 6 + 14, 22, fill="#0a111f", outline="")
-        c.create_text(10, 13, anchor="w", text=legend, fill=TEXT,
+        n_found  = len(self._mp_found)
+        n_missed = len(self._mp_remain) if self._mp_finished else 0
+        legend_txt = (f"{n_found} found  |  {n_missed} missed -- hover for names"
+                      if self._mp_finished else f"{n_found} / {self._mp_total} placed")
+        c.create_rectangle(4, 4, len(legend_txt) * 6 + 14, 22, fill="#0a111f", outline="")
+        c.create_text(10, 13, anchor="w", text=legend_txt, fill=TEXT,
                       font=("Helvetica Neue", 10))
 
     def _mp_hover(self, event):
@@ -1591,7 +1960,6 @@ class App:
         self._mp_hide_tooltip()
         border_col = MAP_FOUND2 if found else MAP_MISS
         name_col   = SUCCESS    if found else ERROR
-        label_txt  = ("Found: " if found else "Missed: ") + disp(name)
 
         tw = tk.Toplevel(self.root)
         tw._code = code
@@ -1600,15 +1968,14 @@ class App:
         tw.attributes("-topmost", True)
         flag_lbl = tk.Label(tw, bg=CARD, text="...", fg=MUTED, font=self.fX)
         flag_lbl.pack(padx=10, pady=(8, 2))
-        tk.Label(tw, text=label_txt, font=self.fK, bg=CARD,
-                 fg=name_col, padx=10, pady=6).pack()
-
+        tk.Label(tw, text=("Found: " if found else "Missed: ") + disp(name),
+                 font=self.fK, bg=CARD, fg=name_col, padx=10, pady=6).pack()
         rx = self.root.winfo_rootx() + event.x + 16
         ry = self.root.winfo_rooty() + event.y - 10
         tw.geometry(f"+{rx}+{ry}")
         self._mp_tooltip_win = tw
 
-        def _load(c2=code, lbl=flag_lbl):
+        def _load_thumb(c2=code, lbl=flag_lbl):
             try:
                 data = fetch_bytes(f"https://flagcdn.com/w80/{c2}.png")
                 img  = Image.open(BytesIO(data)).resize((80, 50))
@@ -1623,7 +1990,7 @@ class App:
                 self.root.after(0, _set)
             except Exception:
                 pass
-        threading.Thread(target=_load, daemon=True).start()
+        threading.Thread(target=_load_thumb, daemon=True).start()
 
     def _mp_hide_tooltip(self):
         if self._mp_tooltip_win:
@@ -1640,7 +2007,7 @@ class App:
         self._submit_score(self._player or "Anonymous",
                            self._mp_mode, n_found, self._mp_total)
         try:
-            self._mp_ent.config(state="disabled")
+            self._mp_input.config(state="disabled")
         except Exception:
             pass
         try:
@@ -1657,38 +2024,43 @@ class App:
             self._mp_results_win.lift()
             self._mp_results_win.focus_set()
             return
+
         missed  = list(self._mp_remain.items())
         n_found = len(self._mp_found)
         pct     = int(n_found / self._mp_total * 100)
-        grade, gcol = (
+        grade, grade_colour = (
             ("Perfect -- every country!", SUCCESS) if pct == 100 else
             ("Excellent geographer!",     INFO)    if pct >= 80  else
             ("Good effort!",              WARNING) if pct >= 60  else
             ("Keep exploring!",           MUTED)
         )
-        rw = tk.Toplevel(self.root)
-        rw.title("Map Results")
-        rw.configure(bg=BG)
-        rw.geometry("780x700")
-        self._mp_results_win = rw
+        win = tk.Toplevel(self.root)
+        win.title("Map Results")
+        win.configure(bg=BG)
+        win.geometry("780x700")
+        self._mp_results_win = win
 
-        tk.Label(rw, text="Map Complete!", font=self.fT, bg=BG, fg=TEXT).pack(pady=(18, 2))
-        tk.Label(rw, text=grade, font=self.fS, bg=BG, fg=gcol).pack()
-        tk.Label(rw, text=f"You placed  {n_found} / {self._mp_total}  ({pct}%)",
+        tk.Label(win, text="Map Complete!", font=self.fT, bg=BG, fg=TEXT).pack(pady=(18, 2))
+        tk.Label(win, text=grade, font=self.fS, bg=BG, fg=grade_colour).pack()
+        tk.Label(win, text=f"You placed  {n_found} / {self._mp_total}  ({pct}%)",
                  font=self.fB, bg=BG, fg=TEXT).pack(pady=(4, 2))
-        saved_to = ("server + local" if (self._remote and self._remote.base)
-                    else "local only")
-        tk.Label(rw, text=f"Score saved ({saved_to}) for {self._player or 'Anonymous'}",
-                 font=self.fX, bg=BG, fg=INFO).pack(pady=(0, 4))
-        tk.Label(rw, text="Hover over the map to see any country's name.",
+
+        if self._logged_in_user:
+            saved_note = f"Saved to your account  ({self._logged_in_user})"
+        elif self._remote and self._remote.base:
+            saved_note = "Saved locally (not logged in -- score not on server)"
+        else:
+            saved_note = "Saved locally only"
+        tk.Label(win, text=saved_note, font=self.fX, bg=BG, fg=INFO).pack(pady=(0, 4))
+        tk.Label(win, text="Hover over the map to see any country's name.",
                  font=self.fX, bg=BG, fg=MUTED).pack(pady=(0, 6))
 
-        nb = ttk.Notebook(rw)
-        nb.pack(fill="both", expand=True, padx=16, pady=(0, 8))
-        tab_miss  = tk.Frame(nb, bg=BG)
-        tab_found = tk.Frame(nb, bg=BG)
-        nb.add(tab_miss,  text=f"  Missed ({len(missed)})  ")
-        nb.add(tab_found, text=f"  Guessed ({n_found})  ")
+        tabs = ttk.Notebook(win)
+        tabs.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        tab_missed  = tk.Frame(tabs, bg=BG)
+        tab_guessed = tk.Frame(tabs, bg=BG)
+        tabs.add(tab_missed,  text=f"  Missed ({len(missed)})  ")
+        tabs.add(tab_guessed, text=f"  Guessed ({n_found})  ")
 
         def _make_grid(parent, items, border_col, name_col):
             outer = tk.Frame(parent, bg=BG)
@@ -1699,10 +2071,10 @@ class App:
             cv.pack(side="left", fill="both", expand=True)
             sb.config(command=cv.yview)
             sf  = tk.Frame(cv, bg=BG)
-            win = cv.create_window((0, 0), window=sf, anchor="nw")
+            w   = cv.create_window((0, 0), window=sf, anchor="nw")
             sf.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
-            cv.bind("<Configure>", lambda e: cv.itemconfig(win, width=e.width))
-            def _wheel(e, c=cv):
+            cv.bind("<Configure>", lambda e: cv.itemconfig(w, width=e.width))
+            def _wheel(e):
                 cv.yview_scroll(-1 if (e.num == 4 or e.delta > 0) else 1, "units")
             for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
                 cv.bind(seq, _wheel)
@@ -1713,16 +2085,16 @@ class App:
                 return
             for i, (code, name) in enumerate(
                     sorted(items, key=lambda x: disp(x[1]))):
-                r, col = divmod(i, 3)
+                row_idx, col_idx = divmod(i, 3)
                 cell = tk.Frame(sf, bg=CARD,
                                 highlightbackground=border_col, highlightthickness=1)
-                cell.grid(row=r, column=col, padx=4, pady=4, sticky="nsew")
-                sf.columnconfigure(col, weight=1)
-                fl = tk.Label(cell, text="...", bg=CARD, fg=MUTED, font=self.fX)
-                fl.pack(pady=(6, 2))
+                cell.grid(row=row_idx, column=col_idx, padx=4, pady=4, sticky="nsew")
+                sf.columnconfigure(col_idx, weight=1)
+                flag_lbl = tk.Label(cell, text="...", bg=CARD, fg=MUTED, font=self.fX)
+                flag_lbl.pack(pady=(6, 2))
                 tk.Label(cell, text=disp(name), font=self.fX, bg=CARD,
                          fg=name_col, wraplength=170, justify="center").pack(pady=(0, 6))
-                def _fetch(c3=code, lbl=fl):
+                def _fetch_thumb(c3=code, lbl=flag_lbl):
                     try:
                         data = fetch_bytes(f"https://flagcdn.com/w80/{c3}.png")
                         img  = Image.open(BytesIO(data)).resize((72, 44))
@@ -1737,27 +2109,27 @@ class App:
                         self.root.after(0, _set)
                     except Exception:
                         pass
-                threading.Thread(target=_fetch, daemon=True).start()
+                threading.Thread(target=_fetch_thumb, daemon=True).start()
 
-        _make_grid(tab_miss,  missed,
+        _make_grid(tab_missed,  missed,
                    border_col=MAP_MISS,   name_col=ERROR)
-        _make_grid(tab_found,
+        _make_grid(tab_guessed,
                    [(code, next(n for n, c2 in ALL_COUNTRIES if c2 == code))
                     for code in self._mp_found],
                    border_col=MAP_FOUND2, name_col=SUCCESS)
 
-        bf = tk.Frame(rw, bg=BG)
-        bf.pack(pady=(0, 12))
-        tk.Button(bf, text="Back to Map", font=self.fX, bg=ACCENT, fg=TEXT,
+        btn_row = tk.Frame(win, bg=BG)
+        btn_row.pack(pady=(0, 12))
+        tk.Button(btn_row, text="Back to Map", font=self.fX, bg=ACCENT, fg=TEXT,
                   relief="flat", cursor="hand2", padx=16, pady=8,
-                  command=rw.destroy).pack(side="left", padx=8)
-        tk.Button(bf, text="Leaderboard", font=self.fX, bg=GOLD, fg="#1a0f00",
+                  command=win.destroy).pack(side="left", padx=8)
+        tk.Button(btn_row, text="Leaderboard", font=self.fX, bg=GOLD, fg="#1a0f00",
                   relief="flat", cursor="hand2", padx=16, pady=8,
-                  command=lambda: (rw.destroy(), self._leaderboard())).pack(
+                  command=lambda: (win.destroy(), self._leaderboard())).pack(
                   side="left", padx=8)
-        tk.Button(bf, text="Main Menu", font=self.fS, bg=HIGHLIGHT, fg="white",
-                  relief="flat", cursor="hand2", padx=16, pady=8,
-                  command=lambda: (rw.destroy(), self._menu())).pack(side="left", padx=8)
+        tk.Button(btn_row, text="Main Menu", font=self.fS, bg=HIGHLIGHT, fg="white",
+                  relief="flat", cursor="hand2", padx=16, pady=10,
+                  command=lambda: (win.destroy(), self._menu())).pack(side="left", padx=8)
 
 
 # ---------------------------------------------------------------------------
